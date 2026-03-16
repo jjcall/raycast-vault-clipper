@@ -159,33 +159,33 @@ Each saved note looks like this:
 
 ```markdown
 ---
-title: "Brecka Daily Supplement Stack Kids"
+title: "Punks vs Rude Boys Subcultures"
 type: clip
 subtype: resource
-source: https://x.com/...
-author: "Camus"
+source: https://x.com/timecaptales/status/1736190618320158819
+author: "Time Capsule Tales"
 tags:
-  - supplements
-  - health
-  - nutrition
+  - subcultures
+  - music-history
+  - fashion
 date: 2026-03-16
 ---
 
-# Brecka Daily Supplement Stack Kids
+# Punks vs Rude Boys Subcultures
 
 ## Summary
 
-Gary Brecka recommends a daily stack...
+A comparison of two iconic youth subcultures: punks, known for their anti-establishment views and DIY aesthetic, and rude boys, rooted in the Jamaican diaspora with sharp suits and ties to ska and reggae music.
 
 ## Tweet
 
-> Gary Brecka lays out his no-BS "must-have" daily stack...
+> Punks were known for their anti-establishment views and ripped clothing, safety pins, and mohawks dyed in bright colors. Rude boys were part of a subculture that had its origins in the Jamaican diaspora with sharp suits and pork pie hats closely associated with ska and reggae...
 
 ## Notes
 
 ---
 
-[[supplements]]  [[health]]  [[nutrition]]
+[[subcultures]]  [[music-history]]  [[fashion]]
 ```
 
 ---
