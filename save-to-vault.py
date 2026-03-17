@@ -130,7 +130,50 @@ def fetch_youtube(url):
     return {"title": title, "author": author, "content": desc}
 
 
-def fetch_webpage(url, max_chars):
+def fetch_from_browser(browser):
+    """Extract rendered page content directly from the browser tab via JS execution.
+    Bypasses bot protection since the browser has already loaded the page."""
+    js = """(function() {
+        var title = document.title;
+        var text = document.body.innerText;
+        var metas = document.querySelectorAll('meta[name="author"], meta[property="author"]');
+        var author = metas.length ? metas[0].getAttribute('content') : '';
+        return JSON.stringify({title: title, text: text, author: author});
+    })()"""
+
+    scripts = {
+        "chrome": f'tell application "Google Chrome" to execute javascript "{js}" in active tab of front window',
+        "safari": f'tell application "Safari" to do javascript "{js}" in current tab of front window',
+    }
+    script = scripts.get(browser)
+    if not script:
+        return None
+
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+
+    try:
+        data = json.loads(result.stdout.strip())
+        return data
+    except Exception:
+        return None
+
+
+def fetch_webpage(url, max_chars, browser=None):
+    # Try direct browser extraction first (bypasses bot protection)
+    if browser:
+        browser_data = fetch_from_browser(browser)
+        if browser_data and len(browser_data.get("text", "")) > 200:
+            title = browser_data.get("title", "")
+            title = re.split(r"\s*[|\-—]\s*", title)[0].strip()
+            return {
+                "title": title,
+                "author": browser_data.get("author", ""),
+                "content": browser_data["text"][:max_chars],
+            }
+
+    # Fall back to trafilatura (for clipboard URLs without browser context)
     downloaded = trafilatura.fetch_url(url)
     text = trafilatura.extract(
         downloaded,
@@ -156,7 +199,7 @@ def fetch_webpage(url, max_chars):
 # ── AI ────────────────────────────────────────────────────────────────────────
 
 def build_prompt(content_type, data, tag_count):
-    tag_instruction = f"array of {tag_count} lowercase single-word tags"
+    tag_instruction = f"array of {tag_count} lowercase tags (single words or hyphenated if two words, e.g. 'design', 'user-interface')"
 
     if content_type == "tweet":
         return f"""Tweet by @{data['handle']} ({data['author']}):
@@ -175,7 +218,6 @@ Return JSON with:
 Description: {data['content']}
 
 Return JSON with:
-- "title": concise 3-8 word title capturing the specific topic
 - "summary": 2-3 sentences on what the video covers and why it matters
 - "points": array of 3-4 key takeaways
 - "tags": {tag_instruction}
@@ -188,7 +230,6 @@ Author: {data.get('author', 'unknown')}
 {data['content']}
 
 Return JSON with:
-- "title": concise 3-8 word title capturing the specific topic
 - "summary": 2-3 sentences on what this covers and why it matters
 - "points": array of 3-5 key takeaways
 - "tags": {tag_instruction}
@@ -263,9 +304,13 @@ def ai_process(content_type, data, config):
 
 def build_note(url, content_type, data, ai):
     date = datetime.now().strftime("%Y-%m-%d")
-    title = ai.get("title", data.get("title", "Untitled"))
+    # Tweets get an AI-generated title; webpages and YouTube use the source title directly
+    if content_type == "tweet":
+        title = ai.get("title", "Untitled")
+    else:
+        title = data.get("title") or ai.get("title", "Untitled")
     summary = ai.get("summary", "")
-    tags = ai.get("tags", [])
+    tags = [re.sub(r"\s+", "-", t.lower().strip()) for t in ai.get("tags", [])]
     points = ai.get("points", [])
     clip_type = ai.get("type", content_type)
 
@@ -355,28 +400,52 @@ def save(title, note, config):
 
 ICONS = {"tweet": "🐦", "youtube": "▶️", "webpage": "🌐"}
 
+def fetch_for_url(url, config, from_browser=False):
+    content_type = detect_type(url)
+    if content_type == "tweet":
+        data = fetch_tweet(url)
+    elif content_type == "youtube":
+        data = fetch_youtube(url)
+    else:
+        browser = config["browser"] if from_browser else None
+        data = fetch_webpage(url, config["capture"]["max_content_chars"], browser)
+    return content_type, data
+
+
 def main():
     config = load_config()
 
     print("Reading browser tab...")
-    url = get_url(config["browser"])
-    if not url:
+    browser_url = get_url(config["browser"])
+    clip_url = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout.strip()
+    clip_url = clip_url if clip_url.startswith("http") else None
+
+    if not browser_url and not clip_url:
         print("❌ No URL found. Open a browser tab or copy a URL to clipboard.")
         sys.exit(1)
 
+    # Try browser URL first, fall back to clipboard if extraction fails
+    url = browser_url or clip_url
     content_type = detect_type(url)
     print(f"{ICONS[content_type]} Fetching {content_type}...")
 
     try:
-        if content_type == "tweet":
-            data = fetch_tweet(url)
-        elif content_type == "youtube":
-            data = fetch_youtube(url)
-        else:
-            data = fetch_webpage(url, config["capture"]["max_content_chars"])
+        content_type, data = fetch_for_url(url, config, from_browser=bool(browser_url))
     except Exception as e:
-        print(f"❌ Fetch failed: {e}")
-        sys.exit(1)
+        data = {}
+
+    # If browser tab yielded no content, silently retry with clipboard URL
+    if not data.get("content") and content_type != "youtube":
+        if clip_url and clip_url != browser_url:
+            print(f"↩️ Retrying with clipboard URL...")
+            url = clip_url
+            content_type = detect_type(url)
+            print(f"{ICONS[content_type]} Fetching {content_type}...")
+            try:
+                content_type, data = fetch_for_url(url, config, from_browser=False)
+            except Exception as e:
+                print(f"❌ Fetch failed: {e}")
+                sys.exit(1)
 
     if not data.get("content") and content_type != "youtube":
         print("❌ Couldn't extract content. Page may require login.")
