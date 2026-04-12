@@ -52,7 +52,13 @@ cd raycast-vault-clipper
 ### 2. Install dependencies
 
 ```bash
-pip3 install requests trafilatura
+pip3 install requests trafilatura markdownify
+```
+
+If you're on macOS with Homebrew Python and see an "externally-managed-environment" error:
+
+```bash
+pip3 install --break-system-packages --user requests trafilatura markdownify
 ```
 
 ### 3. Configure
@@ -88,7 +94,7 @@ All settings live in `config.json` (gitignored, your local copy only).
 | Key | Default | Description |
 |-----|---------|-------------|
 | `vault_path` | `~/Documents/Obsidian Vault` | Path to your Obsidian vault |
-| `output_folder` | `Notes/Resources` | Folder inside vault where clips go |
+| `output_folder` | `Sources/clips` | Folder inside vault where clips go |
 | `browser` | `chrome` | Where to read the active tab: `chrome` or `safari` |
 | `llm.provider` | `ollama` | `ollama`, `openai`, or `anthropic` |
 | `llm.model` | `llama3.2:3b` | Model name |

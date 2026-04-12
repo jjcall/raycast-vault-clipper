@@ -1,6 +1,6 @@
 {
   "vault_path": "~/Documents/Obsidian Vault",
-  "output_folder": "Notes/Resources",
+  "output_folder": "Sources/clips",
   "browser": "chrome",
 
   "llm": {

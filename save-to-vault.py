@@ -32,6 +32,12 @@ except ImportError:
     print("❌ Missing dependency: pip3 install trafilatura")
     sys.exit(1)
 
+try:
+    from markdownify import markdownify as md_convert
+except ImportError:
+    print("❌ Missing dependency: pip3 install markdownify")
+    sys.exit(1)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def load_config():
@@ -56,6 +62,38 @@ BROWSER_SCRIPTS = {
     "chrome": 'tell application "Google Chrome" to get URL of active tab of front window',
     "safari": 'tell application "Safari" to get URL of current tab of front window',
 }
+
+def detect_domain(tags):
+    """Use the first tag as domain. Tags are already ranked by relevance."""
+    return tags[0] if tags else "general"
+
+
+def html_to_markdown(html):
+    """Convert HTML to Markdown, stripping nav/footer/sidebar noise."""
+    markdown = md_convert(
+        html,
+        heading_style="ATX",
+        strip=['nav', 'footer', 'aside', 'script', 'style', 'noscript', 'iframe'],
+    )
+    markdown = re.sub(r'\n{3,}', '\n\n', markdown)
+    return markdown.strip()
+
+
+def has_images_in_html(html):
+    """Check if HTML contains img tags (excluding tracking pixels)."""
+    imgs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.I)
+    for src in imgs:
+        if not re.search(r'(tracking|pixel|1x1|spacer|blank)', src, re.I):
+            return True
+    return False
+
+
+def parse_published_date(date_str):
+    """Parse ISO date string to YYYY-MM-DD format, or return None."""
+    if not date_str:
+        return None
+    match = re.match(r'(\d{4}-\d{2}-\d{2})', date_str)
+    return match.group(1) if match else None
 
 def get_url(browser):
     script = BROWSER_SCRIPTS.get(browser)
@@ -111,6 +149,62 @@ def fetch_tweet(url):
     return {"author": author, "handle": handle, "content": text}
 
 
+def fetch_thread_from_browser(browser):
+    """Extract a full thread from the active browser tab on X/Twitter.
+    Returns thread data dict or None if not a thread / extraction fails."""
+    js = "(function(){var articles=document.querySelectorAll('article[data-testid=tweet]');var tweets=[];var mainHandle='';var mainAuthor='';for(var i=0;i<articles.length;i++){var a=articles[i];var textEl=a.querySelector('[data-testid=tweetText]');var nameEl=a.querySelector('[data-testid=User-Name]');if(!textEl)continue;var text=textEl.innerText||'';var handle='';var author='';if(nameEl){var spans=nameEl.querySelectorAll('span');for(var j=0;j<spans.length;j++){var s=spans[j].textContent||'';if(s.indexOf('@')===0){handle=s.substring(1);break;}}var nameSpan=nameEl.querySelector('span');if(nameSpan)author=nameSpan.textContent||'';}if(tweets.length===0){mainHandle=handle;mainAuthor=author;}if(handle&&handle===mainHandle){tweets.push(text);}else if(tweets.length>0){break;}}return JSON.stringify({author:mainAuthor,handle:mainHandle,tweets:tweets,is_thread:tweets.length>1});})()"
+
+    escaped_js = js.replace("\\", "\\\\").replace('"', '\\"')
+    if browser == "chrome":
+        jxa = f'var app=Application("Google Chrome");app.windows[0].activeTab().execute({{javascript:"{escaped_js}"}});'
+    elif browser == "safari":
+        jxa = f'var app=Application("Safari");app.doJavaScript("{escaped_js}",{{in:app.windows[0].currentTab()}});'
+    else:
+        return None
+
+    result = subprocess.run(["osascript", "-l", "JavaScript"], input=jxa, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+
+    try:
+        data = json.loads(result.stdout.strip())
+        if not data.get("is_thread") or len(data.get("tweets", [])) < 2:
+            return None
+        return data
+    except Exception as e:
+        return None
+
+
+def fetch_article_from_browser(browser):
+    """Extract an X Article from the browser tab via JXA.
+    Returns article data dict or None if not an article.
+    
+    Detection: X Articles have article[data-testid=tweet] with large content
+    but NO [data-testid=tweetText] element (regular tweets have tweetText)."""
+    js = "(function(){var tweetText=document.querySelector('[data-testid=tweetText]');if(tweetText)return JSON.stringify({is_article:false});var article=document.querySelector('article[data-testid=tweet]');if(!article||article.innerText.length<500)return JSON.stringify({is_article:false});var nameEl=article.querySelector('[data-testid=User-Name]');var handle='';var author='';if(nameEl){var spans=nameEl.querySelectorAll('span');for(var j=0;j<spans.length;j++){var s=spans[j].textContent||'';if(s.indexOf('@')===0){handle=s.substring(1);break;}}var nameSpan=nameEl.querySelector('span');if(nameSpan)author=nameSpan.textContent||'';}return JSON.stringify({is_article:true,author:author,handle:handle,html:article.innerHTML,textLen:article.innerText.length});})()"
+
+    escaped_js = js.replace("\\", "\\\\").replace('"', '\\"')
+    if browser == "chrome":
+        jxa = f'var app=Application("Google Chrome");app.windows[0].activeTab().execute({{javascript:"{escaped_js}"}});'
+        result = subprocess.run(["osascript", "-l", "JavaScript"], input=jxa, capture_output=True, text=True)
+    elif browser == "safari":
+        jxa = f'var app=Application("Safari");app.doJavaScript("{escaped_js}",{{in:app.windows[0].currentTab()}});'
+        result = subprocess.run(["osascript", "-l", "JavaScript"], input=jxa, capture_output=True, text=True)
+    else:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        data = json.loads(result.stdout.strip())
+        if not data.get("is_article"):
+            return None
+        return data
+    except Exception:
+        return None
+
+
 def fetch_youtube(url):
     oembed = requests.get(
         "https://www.youtube.com/oembed",
@@ -132,24 +226,22 @@ def fetch_youtube(url):
 
 def fetch_from_browser(browser):
     """Extract rendered page content directly from the browser tab via JS execution.
-    Bypasses bot protection since the browser has already loaded the page."""
-    js = """(function() {
-        var title = document.title;
-        var text = document.body.innerText;
-        var metas = document.querySelectorAll('meta[name="author"], meta[property="author"]');
-        var author = metas.length ? metas[0].getAttribute('content') : '';
-        return JSON.stringify({title: title, text: text, author: author});
-    })()"""
+    Bypasses bot protection since the browser has already loaded the page.
+    Returns HTML content for markdown conversion."""
+    js = "(function(){var el=document.querySelector('article')||document.querySelector('[role=\"main\"]')||document.querySelector('main')||document.body;var title=document.title;var html=el.innerHTML;var metas=document.querySelectorAll('meta[name=\"author\"],meta[property=\"author\"],meta[property=\"article:author\"]');var author=metas.length?metas[0].getAttribute('content'):'';var pubMeta=document.querySelector('meta[property=\"article:published_time\"],meta[name=\"date\"]');var published=pubMeta?pubMeta.getAttribute('content'):'';var scripts=document.querySelectorAll('script[type=\"application/ld+json\"]');for(var i=0;i<scripts.length;i++){try{var data=JSON.parse(scripts[i].textContent);if(!author&&data.author){author=typeof data.author==='string'?data.author:(data.author.name||'');}if(!published&&data.datePublished)published=data.datePublished;if(Array.isArray(data['@graph'])){for(var j=0;j<data['@graph'].length;j++){var item=data['@graph'][j];if(!author&&item.author)author=item.author.name||'';if(!published&&item.datePublished)published=item.datePublished;}}}catch(e){}}return JSON.stringify({title:title,html:html,author:author,published:published});})()"
 
-    scripts = {
-        "chrome": f'tell application "Google Chrome" to execute javascript "{js}" in active tab of front window',
-        "safari": f'tell application "Safari" to do javascript "{js}" in current tab of front window',
-    }
-    script = scripts.get(browser)
-    if not script:
+    escaped_js = js.replace("\\", "\\\\").replace('"', '\\"')
+    if browser == "chrome":
+        # Use JXA for Chrome (AppleScript JS execution is blocked)
+        jxa = f'var app=Application("Google Chrome");app.windows[0].activeTab().execute({{javascript:"{escaped_js}"}});'
+        result = subprocess.run(["osascript", "-l", "JavaScript"], input=jxa, capture_output=True, text=True)
+    elif browser == "safari":
+        # AppleScript works fine for Safari
+        jxa = f'var app=Application("Safari");app.doJavaScript("{escaped_js}",{{in:app.windows[0].currentTab()}});'
+        result = subprocess.run(["osascript", "-l", "JavaScript"], input=jxa, capture_output=True, text=True)
+    else:
         return None
 
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if result.returncode != 0:
         return None
 
@@ -200,43 +292,91 @@ def fetch_webpage(url, max_chars, browser=None):
     # Try direct browser extraction first (bypasses bot protection)
     if browser:
         browser_data = fetch_from_browser(browser)
-        if browser_data and len(browser_data.get("text", "")) > 50:
+        if browser_data and len(browser_data.get("html", "")) > 100:
             title = browser_data.get("title", "")
             title = re.split(r"\s*[|\-—]\s*", title)[0].strip()
+            html = browser_data["html"]
+            content = html_to_markdown(html)
             return {
                 "title": title,
                 "author": browser_data.get("author", ""),
-                "content": browser_data["text"][:max_chars],
+                "content": content[:max_chars],
+                "published": parse_published_date(browser_data.get("published", "")),
+                "has_images": has_images_in_html(html),
             }
 
     # Fall back to trafilatura (for clipboard URLs without browser context)
     downloaded = trafilatura.fetch_url(url)
-    text = trafilatura.extract(
+    
+    # Try to get HTML output first for better markdown conversion
+    html_content = trafilatura.extract(
         downloaded,
         include_comments=False,
-        include_tables=False,
+        include_tables=True,
+        include_links=True,
+        include_images=True,
+        output_format='html',
         no_fallback=False,
     ) or ""
+    
+    content = ""
+    has_images = False
+    if html_content:
+        has_images = has_images_in_html(html_content)
+        content = html_to_markdown(html_content)
+    
+    # Fall back to plain text if HTML extraction failed
+    if not content:
+        content = trafilatura.extract(
+            downloaded,
+            include_comments=False,
+            include_tables=False,
+            no_fallback=False,
+        ) or ""
 
     title = ""
     author = ""
+    published = None
     if downloaded:
         title, author, description = extract_html_meta(downloaded)
+        
+        # Try to extract published date from raw HTML
+        pub_match = re.search(
+            r'<meta[^>]+(?:property=["\']article:published_time["\']|name=["\']date["\'])[^>]+content=["\']([^"\']+)["\']',
+            downloaded, re.I
+        ) or re.search(
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property=["\']article:published_time["\']|name=["\']date["\'])',
+            downloaded, re.I
+        )
+        if pub_match:
+            published = parse_published_date(pub_match.group(1))
+        
+        # Try JSON-LD for published date
+        if not published:
+            ld_match = re.search(r'"datePublished"\s*:\s*"([^"]+)"', downloaded)
+            if ld_match:
+                published = parse_published_date(ld_match.group(1))
 
         # If trafilatura extracted nothing, try stripping HTML tags directly
-        if not text:
-            text = strip_html_to_text(downloaded)
+        if not content:
+            content = strip_html_to_text(downloaded)
 
         # Last resort: use meta description if we still have nothing
-        if not text and description:
-            text = description
+        if not content and description:
+            content = description
 
-    return {"title": title, "author": author, "content": text[:max_chars]}
+    return {
+        "title": title,
+        "author": author,
+        "content": content[:max_chars],
+        "published": published,
+        "has_images": has_images,
+    }
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 
 def build_prompt(content_type, data, tag_count):
-    tag_instruction = f"array of {tag_count} broad topic tags — use reusable domain words that will appear across many notes (e.g. 'adhd', 'anxiety', 'design', 'productivity', 'ai'). Include specific tool or product names when they are central to the content (e.g. 'claude', 'figma', 'obsidian', 'raycast'). NOT descriptive phrases (NOT 'adhd-struggle', 'anxiety-provoking'). Single words preferred; hyphenate only if the concept genuinely needs two words (e.g. 'user-interface', 'mental-health')"
+    tag_instruction = f"array of {tag_count} broad topic tags — single words only, split compound ideas into separate tags (e.g. 'growth' and 'marketing' NOT 'growth-marketing'; 'ai' and 'tools' NOT 'ai-tools'; 'productivity' NOT 'productivity-hacks'). Use reusable domain words that will appear across many notes (e.g. 'marketing', 'ai', 'productivity', 'design', 'growth'). Include specific product names only when central (e.g. 'claude', 'figma'). NEVER join words with hyphens unless it is a single well-known concept (e.g. 'machine-learning', 'mental-health')"
 
     if content_type == "tweet":
         return f"""Tweet by @{data['handle']} ({data['author']}):
@@ -248,6 +388,30 @@ Return JSON with:
 - "summary": 1-2 sentences capturing the key insight
 - "tags": {tag_instruction}
 - "type": one of: insight, resource, opinion, announcement, question"""
+
+    elif content_type == "thread":
+        return f"""X/Twitter thread by @{data['handle']} ({data['author']}), {data['tweet_count']} tweets:
+
+{data['content']}
+
+Return JSON with:
+- "title": 3-6 word specific title capturing the thread's main topic
+- "summary": 2-4 sentences synthesizing the thread's full argument or narrative
+- "points": array of 3-5 key takeaways from the thread
+- "tags": {tag_instruction}
+- "type": one of: insight, resource, opinion, announcement, tutorial, thread"""
+
+    elif content_type == "article":
+        return f"""X/Twitter Article by @{data.get('handle', '')} ({data.get('author', '')}):
+
+{data['content']}
+
+Return JSON with:
+- "title": 3-8 word specific title capturing the article's main topic
+- "summary": 2-4 sentences synthesizing the article's argument or thesis
+- "points": array of 3-7 key takeaways from the article
+- "tags": {tag_instruction}
+- "type": one of: article, insight, opinion, tutorial, resource"""
 
     elif content_type == "youtube":
         return f"""YouTube video: "{data['title']}" by {data['author']}
@@ -341,8 +505,8 @@ def ai_process(content_type, data, config):
 
 def build_note(url, content_type, data, ai):
     date = datetime.now().strftime("%Y-%m-%d")
-    # Tweets get an AI-generated title; webpages and YouTube use the source title directly
-    if content_type == "tweet":
+    # Tweets, threads, and articles get an AI-generated title; webpages and YouTube use the source title
+    if content_type in ("tweet", "thread", "article"):
         title = ai.get("title", "Untitled")
     else:
         title = data.get("title") or ai.get("title", "Untitled")
@@ -350,6 +514,11 @@ def build_note(url, content_type, data, ai):
     tags = [re.sub(r"\s+", "-", t.lower().strip()) for t in ai.get("tags", [])]
     points = ai.get("points", [])
     clip_type = ai.get("type", content_type)
+    
+    # Wiki integration fields
+    domain = detect_domain(tags)
+    has_images = data.get("has_images", False)
+    published = data.get("published")
 
     tags_yaml = "\n".join(f"  - {t}" for t in tags)
     tags_links = "  ".join(f"[[{t}]]" for t in tags)
@@ -364,6 +533,30 @@ def build_note(url, content_type, data, ai):
 >
 > — [{author}](https://x.com/{handle}) (@{handle})"""
 
+    elif content_type == "thread":
+        handle = data.get("handle", "")
+        author = data.get("author", "")
+        tweets = data.get("tweets", [])
+        thread_quotes = "\n>\n".join(f"> {t}" for t in tweets)
+        body = f"""## Thread ({len(tweets)} tweets)
+
+{thread_quotes}
+>
+> — [{author}](https://x.com/{handle}) (@{handle})"""
+        if points_md:
+            body += f"\n\n## Key Points\n\n{points_md}"
+
+    elif content_type == "article":
+        handle = data.get("handle", "")
+        author = data.get("author", "")
+        body = f"## Article\n\n[X Article by {author}]({url}) — @{handle}"
+        if points_md:
+            body += f"\n\n## Key Points\n\n{points_md}"
+        article_content = data.get("content", "")
+        if article_content:
+            truncated = article_content[:5000]
+            body += f"\n\n## Full Content\n\n{truncated}"
+
     elif content_type == "youtube":
         author = data.get("author", "")
         body = f"## Video\n\n[{data.get('title', title)}]({url}) — {author}"
@@ -376,6 +569,12 @@ def build_note(url, content_type, data, ai):
         if points_md:
             body += f"\n\n## Key Points\n\n{points_md}"
 
+    # Build optional frontmatter fields
+    optional_fields = ""
+    if published:
+        optional_fields += f"published: {published}\n"
+    optional_fields += f"has_images: {str(has_images).lower()}\n"
+
     return title, f"""---
 title: "{title}"
 type: clip
@@ -385,6 +584,8 @@ author: "{data.get('author', '')}"
 tags:
 {tags_yaml}
 date: {date}
+{optional_fields}processed: false
+domain: {domain}
 ---
 
 # {title}
@@ -435,12 +636,45 @@ def save(title, note, config):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-ICONS = {"tweet": "🐦", "youtube": "▶️", "webpage": "🌐"}
+ICONS = {"tweet": "🐦", "thread": "🧵", "youtube": "▶️", "webpage": "🌐", "article": "📝"}
 
 def fetch_for_url(url, config, from_browser=False):
     content_type = detect_type(url)
     if content_type == "tweet":
+        if from_browser:
+            # Try article extraction first (articles have no tweetText element)
+            article_data = fetch_article_from_browser(config["browser"])
+            if article_data:
+                max_chars = config["capture"]["max_content_chars"]
+                html = article_data["html"]
+                content = html_to_markdown(html)
+                return "article", {
+                    "author": article_data["author"],
+                    "handle": article_data.get("handle", ""),
+                    "title": "",
+                    "content": content[:max_chars],
+                    "has_images": has_images_in_html(html),
+                }
+
+            # Then try thread extraction
+            thread_data = fetch_thread_from_browser(config["browser"])
+            if thread_data:
+                max_chars = config["capture"]["max_content_chars"]
+                tweets = thread_data["tweets"]
+                content = "\n\n---\n\n".join(
+                    f"[{i+1}/{len(tweets)}] {t}" for i, t in enumerate(tweets)
+                )
+                return "thread", {
+                    "author": thread_data["author"],
+                    "handle": thread_data["handle"],
+                    "content": content[:max_chars],
+                    "tweet_count": len(tweets),
+                    "tweets": tweets,
+                }
+
+        # Fall back to regular tweet via oembed
         data = fetch_tweet(url)
+        return content_type, data
     elif content_type == "youtube":
         data = fetch_youtube(url)
     else:
@@ -470,6 +704,9 @@ def main():
         content_type, data = fetch_for_url(url, config, from_browser=bool(browser_url))
     except Exception as e:
         data = {}
+
+    if content_type == "thread":
+        print(f"🧵 Thread detected ({data.get('tweet_count', '?')} tweets)")
 
     # If browser tab yielded no content, silently retry with clipboard URL
     if not data.get("content") and content_type != "youtube":
