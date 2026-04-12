@@ -160,11 +160,47 @@ def fetch_from_browser(browser):
         return None
 
 
+def extract_html_meta(html):
+    """Extract title, author, and description from raw HTML."""
+    title = ""
+    author = ""
+    description = ""
+
+    m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+    if m:
+        title = unescape(m.group(1).strip())
+        title = re.split(r"\s*[|\-—]\s*", title)[0].strip()
+
+    m = re.search(r'"author"[^}]*?"name"\s*:\s*"([^"]+)"', html)
+    if m:
+        author = m.group(1)
+
+    for pattern in [
+        r'<meta\s+name="description"\s+content="([^"]*)"',
+        r'<meta\s+property="og:description"\s+content="([^"]*)"',
+    ]:
+        m = re.search(pattern, html, re.I)
+        if m:
+            description = unescape(m.group(1))
+            break
+
+    return title, author, description
+
+
+def strip_html_to_text(html):
+    """Strip scripts, styles, and tags from HTML to get raw visible text."""
+    text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def fetch_webpage(url, max_chars, browser=None):
     # Try direct browser extraction first (bypasses bot protection)
     if browser:
         browser_data = fetch_from_browser(browser)
-        if browser_data and len(browser_data.get("text", "")) > 200:
+        if browser_data and len(browser_data.get("text", "")) > 50:
             title = browser_data.get("title", "")
             title = re.split(r"\s*[|\-—]\s*", title)[0].strip()
             return {
@@ -185,21 +221,22 @@ def fetch_webpage(url, max_chars, browser=None):
     title = ""
     author = ""
     if downloaded:
-        m = re.search(r"<title[^>]*>([^<]+)</title>", downloaded, re.I)
-        if m:
-            title = unescape(m.group(1).strip())
-            title = re.split(r"\s*[|\-—]\s*", title)[0].strip()
+        title, author, description = extract_html_meta(downloaded)
 
-        m = re.search(r'"author"[^}]*?"name"\s*:\s*"([^"]+)"', downloaded)
-        if m:
-            author = m.group(1)
+        # If trafilatura extracted nothing, try stripping HTML tags directly
+        if not text:
+            text = strip_html_to_text(downloaded)
+
+        # Last resort: use meta description if we still have nothing
+        if not text and description:
+            text = description
 
     return {"title": title, "author": author, "content": text[:max_chars]}
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 
 def build_prompt(content_type, data, tag_count):
-    tag_instruction = f"array of {tag_count} lowercase tags (single words or hyphenated if two words, e.g. 'design', 'user-interface')"
+    tag_instruction = f"array of {tag_count} broad topic tags — use reusable domain words that will appear across many notes (e.g. 'adhd', 'anxiety', 'design', 'productivity', 'ai'). Include specific tool or product names when they are central to the content (e.g. 'claude', 'figma', 'obsidian', 'raycast'). NOT descriptive phrases (NOT 'adhd-struggle', 'anxiety-provoking'). Single words preferred; hyphenate only if the concept genuinely needs two words (e.g. 'user-interface', 'mental-health')"
 
     if content_type == "tweet":
         return f"""Tweet by @{data['handle']} ({data['author']}):
