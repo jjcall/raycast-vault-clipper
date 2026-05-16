@@ -152,10 +152,25 @@ For Groq, set `base_url` to `https://api.groq.com/openai` and use a Groq model n
 
 1. Open a page in Chrome (tweet, YouTube video, article, whatever)
 2. Press your Raycast hotkey
-3. Watch the toast notifications as it fetches, summarizes, and saves
+3. The stub note lands in your vault immediately. The summary, tags, and key points fill in seconds later as the LLM finishes.
 4. Check your vault
 
 If no browser is open, copy a URL to your clipboard first. The script will pick it up.
+
+### How async enrichment works
+
+Each capture happens in two phases so the hotkey feels instant:
+
+1. **Sync:** the script reads your tab, fetches the content, writes a stub note (`processed: false`) plus a sidecar JSON in `Sources/clips/_pending/`, and exits.
+2. **Background:** a detached Python subprocess runs the LLM, rewrites the note with summary + tags + key points (`processed: true`), and deletes the sidecar.
+
+If your laptop sleeps mid-process or the LLM is down, the sidecar stays in `_pending/` as a flag. Re-run anytime to clean it up:
+
+```bash
+./save-to-vault.py --sweep
+```
+
+That walks `_pending/`, retries every leftover sidecar, and removes the ones it can process. You can also wire `--sweep` as a second Raycast command if you want a one-click "catch up."
 
 ---
 

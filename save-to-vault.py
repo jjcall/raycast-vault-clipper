@@ -503,24 +503,55 @@ def ai_process(content_type, data, config):
 
 # ── Note builder ──────────────────────────────────────────────────────────────
 
+def interim_title(content_type, data):
+    """Best-effort title before the LLM has weighed in. Used for stub notes."""
+    if content_type == "tweet":
+        text = (data.get("content") or "").strip().replace("\n", " ")
+        if text:
+            snippet = text[:50].rstrip()
+            return snippet + ("..." if len(text) > 50 else "")
+        handle = data.get("handle") or "unknown"
+        return f"Tweet by @{handle}"
+    if content_type == "thread":
+        handle = data.get("handle") or "unknown"
+        count = data.get("tweet_count", len(data.get("tweets") or []))
+        return f"Thread by @{handle} ({count} tweets)"
+    if content_type == "article":
+        handle = data.get("handle") or "unknown"
+        return f"X Article by @{handle}"
+    return data.get("title") or "Untitled"
+
+
 def build_note(url, content_type, data, ai):
+    """Render the full markdown note. If `ai` is empty/None this is a stub
+    (no summary, no tags, processed: false) that the background processor
+    will rewrite once the LLM call completes."""
+    ai = ai or {}
+    is_stub = not ai
+
     date = datetime.now().strftime("%Y-%m-%d")
-    # Tweets, threads, and articles get an AI-generated title; webpages and YouTube use the source title
-    if content_type in ("tweet", "thread", "article"):
-        title = ai.get("title", "Untitled")
+    # Tweets, threads, and articles get an AI-generated title; webpages and YouTube use the source title.
+    # Stubs always use the interim title so filenames stay stable across enrichment.
+    if is_stub:
+        title = interim_title(content_type, data)
+    elif content_type in ("tweet", "thread", "article"):
+        title = ai.get("title", interim_title(content_type, data))
     else:
         title = data.get("title") or ai.get("title", "Untitled")
     summary = ai.get("summary", "")
     tags = [re.sub(r"\s+", "-", t.lower().strip()) for t in ai.get("tags", [])]
     points = ai.get("points", [])
-    clip_type = ai.get("type", content_type)
-    
+    clip_type = ai.get("type", content_type) if not is_stub else content_type
+
     # Wiki integration fields
-    domain = detect_domain(tags)
+    domain = detect_domain(tags) if tags else "unprocessed"
     has_images = data.get("has_images", False)
     published = data.get("published")
 
-    tags_yaml = "\n".join(f"  - {t}" for t in tags)
+    if tags:
+        tags_block = "tags:\n" + "\n".join(f"  - {t}" for t in tags)
+    else:
+        tags_block = "tags: []"
     tags_links = "  ".join(f"[[{t}]]" for t in tags)
     points_md = "\n".join(f"- {p}" for p in points) if points else ""
 
@@ -575,33 +606,34 @@ def build_note(url, content_type, data, ai):
         optional_fields += f"published: {published}\n"
     optional_fields += f"has_images: {str(has_images).lower()}\n"
 
+    processed_flag = "true" if not is_stub else "false"
+    # Escape any literal double quotes in the title so the YAML stays valid
+    title_escaped = title.replace('"', '\\"')
+    author_escaped = (data.get("author") or "").replace('"', '\\"')
+
+    summary_block = f"## Summary\n\n{summary}\n\n" if summary else ""
+    tags_links_block = f"\n{tags_links}\n" if tags_links else ""
+
     return title, f"""---
-title: "{title}"
+title: "{title_escaped}"
 type: clip
 subtype: {clip_type}
 source: {url}
-author: "{data.get('author', '')}"
-tags:
-{tags_yaml}
+author: "{author_escaped}"
+{tags_block}
 date: {date}
-{optional_fields}processed: false
+{optional_fields}processed: {processed_flag}
 domain: {domain}
 ---
 
 # {title}
 
-## Summary
-
-{summary}
-
-{body}
+{summary_block}{body}
 
 ## Notes
 
 ---
-
-{tags_links}
-"""
+{tags_links_block}"""
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 
@@ -616,8 +648,17 @@ def make_filename(title, date, fmt):
         return f"{safe}.md"
 
 
+def output_dir(config):
+    return Path(config["vault_path"]) / config["output_folder"]
+
+
+def pending_dir(config):
+    return output_dir(config) / "_pending"
+
+
 def save(title, note, config):
-    output = Path(config["vault_path"]) / config["output_folder"]
+    """Write the note to the vault, choosing a non-colliding filename."""
+    output = output_dir(config)
     output.mkdir(parents=True, exist_ok=True)
 
     date = datetime.now().strftime("%Y-%m-%d")
@@ -632,7 +673,35 @@ def save(title, note, config):
         path = output / filename
 
     path.write_text(note, encoding="utf-8")
-    return filename
+    return path
+
+
+def write_sidecar(stub_path, url, content_type, data, config):
+    """Stash everything the background processor needs alongside the stub."""
+    pdir = pending_dir(config)
+    pdir.mkdir(parents=True, exist_ok=True)
+    sidecar = pdir / f"{stub_path.stem}.json"
+    payload = {
+        "url": url,
+        "content_type": content_type,
+        "data": data,
+        "stub_path": str(stub_path),
+    }
+    sidecar.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return sidecar
+
+
+def spawn_processor(stub_path):
+    """Fire-and-forget background subprocess to run the LLM enrichment.
+    start_new_session detaches from Raycast so the toast fires immediately."""
+    script = Path(__file__).resolve()
+    subprocess.Popen(
+        [sys.executable, str(script), "--process", str(stub_path)],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -683,7 +752,9 @@ def fetch_for_url(url, config, from_browser=False):
     return content_type, data
 
 
-def main():
+def capture():
+    """Sync path: read URL, fetch content, write a stub note, hand off to
+    a background processor for the slow LLM call, return immediately."""
     config = load_config()
 
     print("Reading browser tab...")
@@ -700,42 +771,114 @@ def main():
     content_type = detect_type(url)
     print(f"{ICONS[content_type]} Fetching {content_type}...")
 
+    fetch_error = None
     try:
         content_type, data = fetch_for_url(url, config, from_browser=bool(browser_url))
     except Exception as e:
+        fetch_error = e
         data = {}
 
     if content_type == "thread":
         print(f"🧵 Thread detected ({data.get('tweet_count', '?')} tweets)")
 
-    # If browser tab yielded no content, silently retry with clipboard URL
+    # If browser tab yielded no content, retry with clipboard URL
     if not data.get("content") and content_type != "youtube":
         if clip_url and clip_url != browser_url:
-            print(f"↩️ Retrying with clipboard URL...")
+            print("↩️ Retrying with clipboard URL...")
             url = clip_url
             content_type = detect_type(url)
             print(f"{ICONS[content_type]} Fetching {content_type}...")
             try:
                 content_type, data = fetch_for_url(url, config, from_browser=False)
+                fetch_error = None
             except Exception as e:
                 print(f"❌ Fetch failed: {e}")
                 sys.exit(1)
 
     if not data.get("content") and content_type != "youtube":
-        print("❌ Couldn't extract content. Page may require login.")
+        if fetch_error:
+            print(f"❌ Fetch failed: {fetch_error}")
+        else:
+            print("❌ Couldn't extract content. Page may require login.")
         sys.exit(1)
 
-    print("⚙️ Summarizing...")
+    # Write the stub note now so the user gets feedback instantly.
+    title, stub_note = build_note(url, content_type, data, ai=None)
+    stub_path = save(title, stub_note, config)
+    write_sidecar(stub_path, url, content_type, data, config)
+    print(f"✅ Saved → {stub_path.name} (enriching in background)")
+
+    # Hand off to the background processor. start_new_session detaches the
+    # subprocess so Raycast considers this command done.
+    spawn_processor(stub_path)
+
+
+def process_pending(stub_path):
+    """Background path: read the sidecar, run the LLM, rewrite the note,
+    delete the sidecar. If the LLM fails the sidecar stays put as a retry
+    flag (re-run with --process or the sweep command picks it up)."""
+    stub_path = Path(stub_path)
+    if not stub_path.exists():
+        return
+
+    config = load_config()
+    sidecar = pending_dir(config) / f"{stub_path.stem}.json"
+    if not sidecar.exists():
+        return  # already processed or never queued
+
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    url = payload["url"]
+    content_type = payload["content_type"]
+    data = payload["data"]
 
     try:
         ai = ai_process(content_type, data, config)
-    except Exception as e:
-        print(f"❌ AI failed: {e}")
-        sys.exit(1)
+    except Exception:
+        # Leave the sidecar in place. A re-run will retry.
+        return
 
-    title, note = build_note(url, content_type, data, ai)
-    filename = save(title, note, config)
-    print(f"✅ Saved → {filename}")
+    _, note = build_note(url, content_type, data, ai)
+    stub_path.write_text(note, encoding="utf-8")
+    try:
+        sidecar.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def sweep_pending():
+    """Process every leftover sidecar in _pending/. Useful if the laptop
+    slept mid-process or the LLM was down. Run via: save-to-vault.py --sweep"""
+    config = load_config()
+    pdir = pending_dir(config)
+    if not pdir.exists():
+        print("Nothing to sweep.")
+        return
+    sidecars = sorted(pdir.glob("*.json"))
+    if not sidecars:
+        print("Nothing to sweep.")
+        return
+    for sidecar in sidecars:
+        stub = output_dir(config) / f"{sidecar.stem}.md"
+        if not stub.exists():
+            continue
+        print(f"⚙️  Processing {stub.name}...")
+        process_pending(stub)
+    print(f"✅ Swept {len(sidecars)} clips.")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--process" and len(args) >= 2:
+        process_pending(args[1])
+        return
+    if args and args[0] == "--sweep":
+        sweep_pending()
+        return
+    capture()
 
 
 if __name__ == "__main__":
