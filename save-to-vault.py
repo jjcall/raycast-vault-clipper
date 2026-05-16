@@ -10,6 +10,7 @@
 # @raycast.icon 🗂️
 # @raycast.description Active browser tab → AI summary + tags → Obsidian vault
 
+import os
 import subprocess
 import sys
 import json
@@ -18,25 +19,75 @@ from datetime import datetime
 from pathlib import Path
 from html import unescape
 
-# ── Dependencies ──────────────────────────────────────────────────────────────
+# ── Auto-bootstrap venv ───────────────────────────────────────────────────────
+# Portability strategy: on first run, create a .venv next to the script and
+# install our deps into it, then re-exec ourselves with the venv's python.
+# After that, every run uses the venv. No PATH games, no PEP 668 errors, no
+# Homebrew-vs-Apple Python confusion.
 
+REQUIRED_PACKAGES = ["requests", "trafilatura", "markdownify"]
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_VENV_DIR = _SCRIPT_DIR / ".venv"
+_VENV_PYTHON = _VENV_DIR / "bin" / "python3"
+
+
+def _bootstrap_venv():
+    """Create the venv and install dependencies. Runs once, ever."""
+    import venv
+
+    print("⚙️  First-run setup: creating venv and installing dependencies...", file=sys.stderr)
+    print("    (this takes 10-30 seconds, only happens once)", file=sys.stderr)
+    venv.create(_VENV_DIR, with_pip=True, clear=False, upgrade_deps=False)
+    try:
+        subprocess.check_call(
+            [str(_VENV_PYTHON), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *REQUIRED_PACKAGES],
+        )
+    except subprocess.CalledProcessError as e:
+        # Bootstrap failed (offline, pip down, etc). Leave the venv so a
+        # retry doesn't have to recreate it; user can rerun and pip resumes.
+        print(f"❌ Bootstrap failed during pip install: {e}", file=sys.stderr)
+        print("    Try running the script again once you have network access.", file=sys.stderr)
+        sys.exit(1)
+
+
+def _ensure_venv():
+    """Make sure we're running inside our venv. Bootstrap and re-exec if not."""
+    # Already inside our venv? Continue with the real script.
+    try:
+        if Path(sys.executable).resolve() == _VENV_PYTHON.resolve():
+            return
+    except OSError:
+        pass
+
+    script = str(Path(__file__).resolve())
+
+    # Venv exists from a previous run. Re-exec immediately, no install.
+    if _VENV_PYTHON.exists():
+        os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), script, *sys.argv[1:]])
+        return  # only reachable if execv was mocked or somehow failed
+
+    # First run ever. Build the venv, then re-exec.
+    _bootstrap_venv()
+    os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), script, *sys.argv[1:]])
+    return  # same as above
+
+
+# Bootstrap is invoked from main() so that importing this module (for tests
+# or external tooling) doesn't trigger a venv build. The real entry point
+# always calls _ensure_venv() before doing anything else.
+
+# ── Dependencies (guaranteed present after _ensure_venv) ──────────────────────
+# These imports succeed at runtime because main() runs _ensure_venv() first,
+# which re-execs us inside the venv that has them installed.
 try:
     import requests
-except ImportError:
-    print("❌ Missing dependency: pip3 install requests")
-    sys.exit(1)
-
-try:
     import trafilatura
-except ImportError:
-    print("❌ Missing dependency: pip3 install trafilatura")
-    sys.exit(1)
-
-try:
     from markdownify import markdownify as md_convert
 except ImportError:
-    print("❌ Missing dependency: pip3 install markdownify")
-    sys.exit(1)
+    # Imported outside the venv (e.g. from a test harness that mocks these).
+    # We don't fail here because the real entry point will bootstrap before
+    # ever using them.
+    pass
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -882,4 +933,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # Make sure deps are available before doing anything real. On first run
+    # this builds .venv/ and re-execs into it; subsequent runs no-op.
+    _ensure_venv()
     main()

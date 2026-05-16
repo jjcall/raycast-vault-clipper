@@ -49,19 +49,7 @@ git clone https://github.com/your-username/raycast-vault-clipper.git
 cd raycast-vault-clipper
 ```
 
-### 2. Install dependencies
-
-```bash
-pip3 install requests trafilatura markdownify
-```
-
-If you're on macOS with Homebrew Python and see an "externally-managed-environment" error:
-
-```bash
-pip3 install --break-system-packages --user requests trafilatura markdownify
-```
-
-### 3. Configure
+### 2. Configure
 
 ```bash
 cp config.example.json config.json
@@ -69,21 +57,38 @@ cp config.example.json config.json
 
 Open `config.json` and fill in your vault path and preferred LLM (see [Configuration](#configuration) below).
 
-### 4. Add to Raycast
+### 3. Add to Raycast
 
 - Open Raycast, go to `⌘,` > Extensions > Scripts
 - Click `+` > Add Scripts Directory > select this repo folder
 - Search "Save to Vault" in Raycast and assign a hotkey (e.g. `⌥⇧S`)
 
-### 5. Fix the shebang (if needed)
+That's it. No `pip install`, no PATH twiddling, no shebang surgery.
 
-The script uses `#!/usr/bin/env python3`. If Raycast can't find your packages, point it at your actual Python:
+### How dependencies work
 
-```bash
-which python3  # find your path
+The script auto-bootstraps a virtual environment the first time you run it. On first run you'll see:
+
+```
+⚙️  First-run setup: creating venv and installing dependencies...
+    (this takes 10-30 seconds, only happens once)
 ```
 
-Then update the first line of `save-to-vault.py` (e.g. `#!/opt/homebrew/bin/python3`).
+That creates `.venv/` next to the script with `requests`, `trafilatura`, and `markdownify` inside. Every run after that uses the venv directly, so the hotkey is instant.
+
+Works with any Python 3.9+ on `PATH` — Apple's `/usr/bin/python3`, Homebrew (Intel or Apple Silicon), pyenv, conda, whatever. The script doesn't care which one it bootstraps from.
+
+If you ever need to rebuild (corruption, Python upgrade, moved the repo): `rm -rf .venv` and run the script once.
+
+#### Tip: warm the venv before assigning the hotkey
+
+So the first Raycast invocation doesn't take 30 seconds, run it once from the terminal first:
+
+```bash
+./save-to-vault.py
+```
+
+The first run will install deps and then complain about no URL (expected). After that, the venv is ready and the Raycast hotkey is instant.
 
 ---
 
