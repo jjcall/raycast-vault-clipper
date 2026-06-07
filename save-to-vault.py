@@ -18,6 +18,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from html import unescape
+from urllib.parse import parse_qs, urlparse
 
 # ── Auto-bootstrap venv ───────────────────────────────────────────────────────
 # Portability strategy: on first run, create a .venv next to the script and
@@ -25,22 +26,22 @@ from html import unescape
 # After that, every run uses the venv. No PATH games, no PEP 668 errors, no
 # Homebrew-vs-Apple Python confusion.
 
-REQUIRED_PACKAGES = ["requests", "trafilatura", "markdownify"]
+REQUIRED_PACKAGES = ["requests", "trafilatura", "markdownify", "youtube-transcript-api"]
+PACKAGE_IMPORTS = {
+    "requests": "requests",
+    "trafilatura": "trafilatura",
+    "markdownify": "markdownify",
+    "youtube-transcript-api": "youtube_transcript_api",
+}
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _VENV_DIR = _SCRIPT_DIR / ".venv"
 _VENV_PYTHON = _VENV_DIR / "bin" / "python3"
 
 
-def _bootstrap_venv():
-    """Create the venv and install dependencies. Runs once, ever."""
-    import venv
-
-    print("⚙️  First-run setup: creating venv and installing dependencies...", file=sys.stderr)
-    print("    (this takes 10-30 seconds, only happens once)", file=sys.stderr)
-    venv.create(_VENV_DIR, with_pip=True, clear=False, upgrade_deps=False)
+def _install_packages(packages):
     try:
         subprocess.check_call(
-            [str(_VENV_PYTHON), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *REQUIRED_PACKAGES],
+            [str(_VENV_PYTHON), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *packages],
         )
     except subprocess.CalledProcessError as e:
         # Bootstrap failed (offline, pip down, etc). Leave the venv so a
@@ -50,11 +51,37 @@ def _bootstrap_venv():
         sys.exit(1)
 
 
+def _missing_required_packages():
+    import importlib.util
+
+    missing = []
+    for package, module in PACKAGE_IMPORTS.items():
+        if importlib.util.find_spec(module) is None:
+            missing.append(package)
+    return missing
+
+
+def _bootstrap_venv():
+    """Create the venv and install dependencies. Runs once, ever."""
+    import venv
+
+    print("⚙️  First-run setup: creating venv and installing dependencies...", file=sys.stderr)
+    print("    (this takes 10-30 seconds, only happens once)", file=sys.stderr)
+    venv.create(_VENV_DIR, with_pip=True, clear=False, upgrade_deps=False)
+    _install_packages(REQUIRED_PACKAGES)
+
+
 def _ensure_venv():
     """Make sure we're running inside our venv. Bootstrap and re-exec if not."""
     # Already inside our venv? Continue with the real script.
     try:
         if Path(sys.executable).resolve() == _VENV_PYTHON.resolve():
+            missing = _missing_required_packages()
+            if missing:
+                print(f"⚙️  Installing missing dependencies: {', '.join(missing)}", file=sys.stderr)
+                _install_packages(missing)
+                script = str(Path(__file__).resolve())
+                os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), script, *sys.argv[1:]])
             return
     except OSError:
         pass
@@ -83,6 +110,7 @@ try:
     import requests
     import trafilatura
     from markdownify import markdownify as md_convert
+    from youtube_transcript_api import YouTubeTranscriptApi
 except ImportError:
     # Imported outside the venv (e.g. from a test harness that mocks these).
     # We don't fail here because the real entry point will bootstrap before
@@ -272,7 +300,7 @@ def get_url(browser):
 def detect_type(url):
     if re.search(r"(twitter\.com|x\.com)/\w+/status/\d+", url):
         return "tweet"
-    if re.search(r"(youtube\.com/watch|youtu\.be/)", url):
+    if re.search(r"(youtube\.com/(watch|shorts|embed)|youtu\.be/)", url):
         return "youtube"
     return "webpage"
 
@@ -455,6 +483,81 @@ def fetch_long_tweet_from_browser(browser, min_chars=800):
         return None
 
 
+def extract_youtube_video_id(url):
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+
+    if host == "youtu.be":
+        return parsed.path.strip("/").split("/")[0]
+
+    if host.endswith("youtube.com"):
+        if parsed.path == "/watch":
+            return parse_qs(parsed.query).get("v", [""])[0]
+        for prefix in ("/shorts/", "/embed/"):
+            if parsed.path.startswith(prefix):
+                return parsed.path[len(prefix):].strip("/").split("/")[0]
+
+    return ""
+
+
+def transcript_entries_to_markdown(transcript):
+    if hasattr(transcript, "to_raw_data"):
+        transcript = transcript.to_raw_data()
+
+    chunks = []
+    current = []
+    current_len = 0
+
+    for entry in transcript or []:
+        if isinstance(entry, dict):
+            text = entry.get("text", "")
+        else:
+            text = getattr(entry, "text", "")
+
+        text = unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or re.fullmatch(r"\[[^\]]+\]", text):
+            continue
+
+        if current and current_len + len(text) > 900:
+            chunks.append(" ".join(current))
+            current = []
+            current_len = 0
+
+        current.append(text)
+        current_len += len(text) + 1
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return "\n\n".join(chunks).strip()
+
+
+def fetch_youtube_transcript(video_id):
+    if not video_id or "YouTubeTranscriptApi" not in globals():
+        return ""
+
+    preferred_languages = ["en", "en-US", "en-GB"]
+    fetch_attempts = []
+
+    if hasattr(YouTubeTranscriptApi, "get_transcript"):
+        fetch_attempts.append(lambda: YouTubeTranscriptApi.get_transcript(video_id, languages=preferred_languages))
+
+    fetch_attempts.append(lambda: YouTubeTranscriptApi().fetch(video_id, languages=preferred_languages))
+    fetch_attempts.append(lambda: YouTubeTranscriptApi().fetch(video_id))
+
+    for attempt in fetch_attempts:
+        try:
+            transcript = attempt()
+            markdown = transcript_entries_to_markdown(transcript)
+            if markdown:
+                return markdown
+        except Exception:
+            continue
+
+    return ""
+
+
 def fetch_youtube(url):
     oembed = requests.get(
         "https://www.youtube.com/oembed",
@@ -471,7 +574,31 @@ def fetch_youtube(url):
     if m:
         desc = unescape(m.group(1))
 
-    return {"title": title, "author": author, "content": desc}
+    video_id = extract_youtube_video_id(url)
+    transcript = fetch_youtube_transcript(video_id)
+
+    if transcript:
+        return {
+            "title": title,
+            "author": author,
+            "content": transcript,
+            "description": desc,
+            "video_id": video_id,
+            "content_source": "transcript",
+            "transcript_available": True,
+            "has_images": False,
+        }
+
+    return {
+        "title": title,
+        "author": author,
+        "content": desc,
+        "description": desc,
+        "video_id": video_id,
+        "content_source": "description",
+        "transcript_available": False,
+        "has_images": False,
+    }
 
 
 def fetch_from_browser(browser):
@@ -669,9 +796,10 @@ Return JSON with:
 - "type": one of: article, insight, opinion, tutorial, resource"""
 
     elif content_type == "youtube":
+        source_label = "Transcript" if data.get("content_source") == "transcript" else "Description"
         return f"""YouTube video: "{data['title']}" by {data['author']}
 
-Description: {data['content']}
+{source_label}: {data['content']}
 
 Return JSON with:
 - "summary": 2-3 sentences on what the video covers and why it matters
@@ -801,15 +929,19 @@ def ai_process(content_type, data, config):
     LLM context stays bounded. The note keeps the full content untouched."""
     llm = config["llm"]
     tag_count = config["capture"]["tag_count"]
+    llm_data = dict(data)
 
-    # Article-like content (long-form posts, threads, full webpages) gets a
-    # bigger budget; short tweets / YouTube descriptions stay small.
-    if content_type in ("article", "thread") or content_type == "webpage":
+    # Article-like content (long-form posts, threads, full webpages, and
+    # YouTube transcripts) gets a bigger budget; short tweets and video
+    # descriptions stay small.
+    if (
+        content_type in ("article", "thread", "webpage")
+        or (content_type == "youtube" and llm_data.get("content_source") == "transcript")
+    ):
         llm_max = config["capture"].get("article_max_chars", 16000)
     else:
         llm_max = config["capture"].get("max_content_chars", 3000)
 
-    llm_data = dict(data)
     if "content" in llm_data and isinstance(llm_data["content"], str):
         llm_data["content"] = llm_data["content"][:llm_max]
 
@@ -919,6 +1051,14 @@ def build_note(url, content_type, data, ai):
         body = f"## Video\n\n[{data.get('title', title)}]({url}) — {author}"
         if points_md:
             body += f"\n\n## Key Points\n\n{points_md}"
+        description = data.get("description", "")
+        video_content = data.get("content", "")
+        content_source = data.get("content_source", "description")
+        if description and content_source == "transcript":
+            body += f"\n\n## Description\n\n{description}"
+        if video_content:
+            heading = "Transcript" if content_source == "transcript" else "Description"
+            body += f"\n\n## {heading}\n\n{video_content}"
 
     else:
         author = data.get("author", "")
@@ -939,6 +1079,9 @@ def build_note(url, content_type, data, ai):
     if published:
         optional_fields += f"published: {published}\n"
     optional_fields += f"has_images: {str(has_images).lower()}\n"
+    if content_type == "youtube":
+        optional_fields += f"content_source: {data.get('content_source', 'description')}\n"
+        optional_fields += f"transcript_available: {str(data.get('transcript_available', False)).lower()}\n"
 
     # State machine for wiki-ingest contract:
     #   Stub (AI pending):       enriched: false   (no processed field)

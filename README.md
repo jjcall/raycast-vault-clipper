@@ -38,14 +38,16 @@ This repo keeps the path simple:
 
 1. Reads the active tab URL from Chrome or Safari, with clipboard fallback.
 2. Detects tweets, X threads, X articles, YouTube videos, and webpages.
-3. Extracts the source content.
+3. Extracts the source content. For YouTube, it tries to pull the transcript
+   first and falls back to the video description.
 4. Writes a stub note immediately.
 5. Runs AI enrichment in the background for summary, key points, tags, and type.
 6. Saves the final note to your configured output folder.
 
 The saved note keeps the full article body under `## Article` or
-`## Full Content`. The `article_max_chars` setting only caps what gets sent to
-the LLM, not what gets stored in Obsidian.
+`## Full Content`, and YouTube captures keep the transcript under
+`## Transcript` when captions are available. The `article_max_chars` setting
+only caps what gets sent to the LLM, not what gets stored in Obsidian.
 
 ### Read Later to Daily
 
@@ -125,7 +127,8 @@ First-run setup: creating venv and installing dependencies...
 ```
 
 That creates `.venv/` next to the script and installs `requests`,
-`trafilatura`, and `markdownify`. Every run after that uses the local venv.
+`trafilatura`, `markdownify`, and `youtube-transcript-api`. Every run after
+that uses the local venv.
 
 To warm it up before assigning a hotkey:
 
