@@ -44,6 +44,11 @@ This repo keeps the path simple:
 5. Runs AI enrichment in the background for summary, key points, tags, and type.
 6. Saves the final note to your configured output folder.
 
+Before it fetches anything, the script checks existing saved notes and pending
+captures for the same source URL. It normalizes common variants like YouTube
+timestamps, `youtu.be` links, and tracking parameters, so a title change should
+not create a second note for the same source.
+
 The saved note keeps the full article body under `## Article` or
 `## Full Content`, and YouTube captures keep the transcript under
 `## Transcript` when captions are available. The `article_max_chars` setting

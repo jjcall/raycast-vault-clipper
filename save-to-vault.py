@@ -18,7 +18,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from html import unescape
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 # ── Auto-bootstrap venv ───────────────────────────────────────────────────────
 # Portability strategy: on first run, create a .venv next to the script and
@@ -1144,6 +1144,88 @@ def pending_dir(config):
     return output_dir(config) / "_pending"
 
 
+TRACKING_QUERY_PREFIXES = ("utm_",)
+TRACKING_QUERY_KEYS = {
+    "fbclid",
+    "gclid",
+    "igshid",
+    "mc_cid",
+    "mc_eid",
+    "si",
+}
+
+
+def canonicalize_url(url):
+    """Normalize source URLs so dedupe works across tracking params and
+    common video/share URL variants."""
+    parsed = urlparse((url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return url.strip()
+
+    scheme = parsed.scheme.lower()
+    host = parsed.netloc.lower().removeprefix("www.")
+    query = parse_qs(parsed.query, keep_blank_values=False)
+
+    video_id = extract_youtube_video_id(url)
+    if video_id and (host == "youtu.be" or host.endswith("youtube.com")):
+        return f"https://www.youtube.com/watch?v={video_id}"
+
+    if host in {"x.com", "twitter.com"} and re.search(r"/status/\d+", parsed.path):
+        clean_path = parsed.path.rstrip("/")
+        return urlunparse((scheme, "x.com", clean_path, "", "", ""))
+
+    clean_query = {}
+    for key, values in query.items():
+        key_lower = key.lower()
+        if key_lower in TRACKING_QUERY_KEYS:
+            continue
+        if any(key_lower.startswith(prefix) for prefix in TRACKING_QUERY_PREFIXES):
+            continue
+        clean_query[key] = values
+
+    clean_query_string = urlencode(clean_query, doseq=True)
+    clean_path = parsed.path.rstrip("/") if parsed.path != "/" else parsed.path
+    return urlunparse((scheme, host, clean_path, "", clean_query_string, ""))
+
+
+def extract_source_from_note(path):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+    match = re.search(r"^source:\s*(.+?)\s*$", text, flags=re.MULTILINE)
+    if not match:
+        return ""
+    return match.group(1).strip().strip('"').strip("'")
+
+
+def find_existing_capture(config, url):
+    """Return an existing clip path/sidecar for this canonical source URL."""
+    canonical = canonicalize_url(url)
+    output = output_dir(config)
+
+    if output.exists():
+        for clip in output.glob("*.md"):
+            source = extract_source_from_note(clip)
+            if source and canonicalize_url(source) == canonical:
+                return clip
+
+    pdir = pending_dir(config)
+    if pdir.exists():
+        for sidecar in pdir.glob("*.json"):
+            try:
+                payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            source = payload.get("url", "")
+            if source and canonicalize_url(source) == canonical:
+                stub = Path(payload.get("stub_path", ""))
+                return stub if stub.exists() else sidecar
+
+    return None
+
+
 def save(title, note, config):
     """Write the note to the vault, choosing a non-colliding filename."""
     output = output_dir(config)
@@ -1270,8 +1352,15 @@ def capture():
         print("❌ No URL found. Open a browser tab or copy a URL to clipboard.")
         sys.exit(1)
 
-    # Try browser URL first, fall back to clipboard if extraction fails
-    url = browser_url or clip_url
+    # Try browser URL first, fall back to clipboard if extraction fails.
+    # Canonicalization keeps repeated captures from slipping through as
+    # separate notes because of tracking params, YouTube timestamps, etc.
+    url = canonicalize_url(browser_url or clip_url)
+    existing = find_existing_capture(config, url)
+    if existing:
+        print(f"↩️ Already saved → {existing.name}")
+        return
+
     content_type = detect_type(url)
     print(f"{ICONS[content_type]} Fetching {content_type}...")
 
@@ -1289,7 +1378,11 @@ def capture():
     if not data.get("content") and content_type != "youtube":
         if clip_url and clip_url != browser_url:
             print("↩️ Retrying with clipboard URL...")
-            url = clip_url
+            url = canonicalize_url(clip_url)
+            existing = find_existing_capture(config, url)
+            if existing:
+                print(f"↩️ Already saved → {existing.name}")
+                return
             content_type = detect_type(url)
             print(f"{ICONS[content_type]} Fetching {content_type}...")
             try:
