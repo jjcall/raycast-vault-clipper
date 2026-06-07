@@ -130,6 +130,111 @@ def html_to_markdown(html):
     return markdown.strip()
 
 
+def clean_chrome(markdown):
+    """Generic cleanup for content-platform UI chrome (X, Substack, Medium,
+    Ghost, generic blogs). Strips:
+      - Image markdown (profile avatars, header images, inline)
+      - Empty link skeletons left by image stripping
+      - Standalone engagement counts (8.6K, 184M, 484)
+      - Subscribe / Unsubscribe / Restack / Share / Follow nudges
+      - Author/handle links, analytics links
+      - X-specific: timestamp permalinks, View quotes/replies, ·/• separators,
+        Relevant / For You / Following tab headers
+      - Substack: sponsor blocks, "X Likes∙", "Y Restacks", date stamps,
+        "reader-supported publication" footer
+      - Generic: Previous / Next nav, "Edited by ...", "Find this interesting?"
+    Safe to apply to any article-shaped content."""
+    # Strip inline + standalone images first (covers most platform chrome)
+    markdown = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", markdown)
+
+    # Strip multi-line sponsor blocks. Substack pattern is:
+    #   **Sponsored by [Name](url)**: <paragraph>
+    #   (optional image)
+    # Catch the bold-prefixed paragraph; the image after it is already gone.
+    markdown = re.sub(
+        r"\*\*\s*Sponsored\s+by[^\n]*\*\*[^\n]*",
+        "",
+        markdown,
+        flags=re.IGNORECASE,
+    )
+    # Also catch unbolded "Sponsored by ..." lines
+    markdown = re.sub(
+        r"^Sponsored\s+by[^\n]*$",
+        "",
+        markdown,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+
+    lines = []
+    for raw in markdown.split("\n"):
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            lines.append(line)
+            continue
+        # Standalone engagement counts: "8.6K", "184M", "1,234", "484"
+        if re.fullmatch(r"[\d,.]+\s*[KMB]?", stripped, re.I):
+            continue
+        # Subscribe / Unsubscribe / Restack nudges
+        if re.fullmatch(r"(Click to )?(Sub|Unsub|Re)scribe.*", stripped, re.I):
+            continue
+        # Single-word UI buttons (common across platforms)
+        if re.fullmatch(
+            r"(Share|Like|Subscribe|Restack|Previous|Next|Comment|Follow|Following)",
+            stripped,
+            re.I,
+        ):
+            continue
+        # Bare author/handle links: "[NAME](/handle)" or "[@handle](/handle)"
+        if re.fullmatch(r"\[@?[^\]]+\]\(/[\w-]+\)", stripped):
+            continue
+        # Analytics link
+        if re.fullmatch(r"\[[^\]]+\]\([^)]*/analytics\)", stripped):
+            continue
+        # Empty link skeleton left after image-strip: "[](href)"
+        if re.fullmatch(r"\[\s*\]\([^)]+\)", stripped):
+            continue
+        # X timestamp permalink: "[7:23 AM · May 15, 2026](/handle/status/123)"
+        if re.fullmatch(
+            r"\[\s*\d{1,2}:\d{2}\s*[AP]M\s*[·•]\s*\w+\s+\d{1,2},?\s+\d{4}\s*\]\([^)]+\)",
+            stripped,
+        ):
+            continue
+        # View quotes / View replies / View tweet
+        if re.fullmatch(r"\[\s*View\s+\w+\s*\]\([^)]+\)", stripped):
+            continue
+        # Standalone middle-dot separator
+        if re.fullmatch(r"[·•∙]", stripped):
+            continue
+        # X tab headers
+        if re.fullmatch(r"(Relevant|For You|Following)", stripped):
+            continue
+        # Substack-style standalone date: "May 14, 2026"
+        if re.fullmatch(r"\w+\s+\d{1,2},?\s+\d{4}", stripped):
+            continue
+        # Substack engagement summary: "484 Likes∙", "33 Restacks"
+        if re.fullmatch(r"\d+\s*Likes?\s*[∙·•]?", stripped, re.I):
+            continue
+        if re.fullmatch(r"\[?\s*\d+\s+Restacks?\s*\]?\(?[^)]*\)?", stripped, re.I):
+            continue
+        # "Find this interesting? Subscribe to my blog!" / "join us if you're into..."
+        if re.match(r"^(Find this interesting\?|Join us if)", stripped, re.I):
+            continue
+        # Editor credit: "*Edited by [Name](url).*"
+        if re.fullmatch(r"\*?\s*Edited\s+by\s+\[[^\]]+\]\([^)]+\)\.?\s*\*?", stripped, re.I):
+            continue
+        # Substack "reader-supported publication" footer
+        if re.search(r"reader-supported publication", stripped, re.I):
+            continue
+        lines.append(line)
+    cleaned = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+# Backward-compat alias for existing call sites and tests
+clean_x_chrome = clean_chrome
+
+
 def has_images_in_html(html):
     """Check if HTML contains img tags (excluding tracking pixels)."""
     imgs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.I)
@@ -229,10 +334,54 @@ def fetch_thread_from_browser(browser):
 def fetch_article_from_browser(browser):
     """Extract an X Article from the browser tab via JXA.
     Returns article data dict or None if not an article.
-    
+
     Detection: X Articles have article[data-testid=tweet] with large content
-    but NO [data-testid=tweetText] element (regular tweets have tweetText)."""
-    js = "(function(){var tweetText=document.querySelector('[data-testid=tweetText]');if(tweetText)return JSON.stringify({is_article:false});var article=document.querySelector('article[data-testid=tweet]');if(!article||article.innerText.length<500)return JSON.stringify({is_article:false});var nameEl=article.querySelector('[data-testid=User-Name]');var handle='';var author='';if(nameEl){var spans=nameEl.querySelectorAll('span');for(var j=0;j<spans.length;j++){var s=spans[j].textContent||'';if(s.indexOf('@')===0){handle=s.substring(1);break;}}var nameSpan=nameEl.querySelector('span');if(nameSpan)author=nameSpan.textContent||'';}return JSON.stringify({is_article:true,author:author,handle:handle,html:article.innerHTML,textLen:article.innerText.length});})()"
+    but NO [data-testid=tweetText] element (regular tweets have tweetText).
+
+    Before returning HTML we clone the article and strip X-specific UI chrome
+    (author header, subscribe button, engagement counts, action bar) so the
+    LLM never sees them. Author/handle are read BEFORE stripping so we keep
+    them as separate fields."""
+    js = (
+        "(function(){"
+        "var tweetText=document.querySelector('[data-testid=tweetText]');"
+        "if(tweetText)return JSON.stringify({is_article:false});"
+        "var article=document.querySelector('article[data-testid=tweet]');"
+        "if(!article||article.innerText.length<500)return JSON.stringify({is_article:false});"
+        # Read author/handle before stripping
+        "var nameEl=article.querySelector('[data-testid=User-Name]');"
+        "var handle='';var author='';"
+        "if(nameEl){var spans=nameEl.querySelectorAll('span');"
+        "for(var j=0;j<spans.length;j++){var s=spans[j].textContent||'';"
+        "if(s.indexOf('@')===0){handle=s.substring(1);break;}}"
+        "var nameSpan=nameEl.querySelector('span');"
+        "if(nameSpan)author=nameSpan.textContent||'';}"
+        # Clone and strip X UI noise
+        "var clone=article.cloneNode(true);"
+        "var noise=["
+        "'[data-testid=User-Name]',"               # author/handle header
+        "'[role=group]',"                          # action bar (reply/retweet/like)
+        "'[data-testid=caret]',"                   # ... menu
+        "'[data-testid=app-text-transition-container]',"  # animated counters
+        "'[aria-label*=\"reposts\"]',"             # retweet count
+        "'[aria-label*=\"Repost\"]',"
+        "'[aria-label*=\"likes\"]',"               # like count
+        "'[aria-label*=\"Like\"]',"
+        "'[aria-label*=\"replies\"]',"             # reply count
+        "'[aria-label*=\"Repl\"]',"
+        "'[aria-label*=\"views\"]',"               # view count
+        "'[aria-label*=\"View\"]',"
+        "'[aria-label*=\"Bookmark\"]',"
+        "'a[href$=\"/analytics\"]',"               # analytics link
+        "'[data-testid*=\"ubscribe\"]',"           # Subscribe / Unsubscribe
+        "'[data-testid=tweetButtonInline]'"
+        "];"
+        "for(var k=0;k<noise.length;k++){"
+        "var nodes=clone.querySelectorAll(noise[k]);"
+        "for(var l=0;l<nodes.length;l++)nodes[l].remove();}"
+        "return JSON.stringify({is_article:true,author:author,handle:handle,html:clone.innerHTML,textLen:clone.innerText.length});"
+        "})()"
+    )
 
     escaped_js = js.replace("\\", "\\\\").replace('"', '\\"')
     if browser == "chrome":
@@ -250,6 +399,56 @@ def fetch_article_from_browser(browser):
     try:
         data = json.loads(result.stdout.strip())
         if not data.get("is_article"):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def fetch_long_tweet_from_browser(browser, min_chars=800):
+    """Extract a long-form tweet's full body from the browser.
+
+    Why this exists: X Premium tweets can be up to 25k chars. The oembed API
+    truncates them to a snippet, so we lose almost all the content. This path
+    reads the rendered tweetText element directly from the DOM, giving us the
+    real body for posts like multi-point lists or essay-style tweets.
+
+    Distinguishes from regular tweets by content length (>= min_chars).
+    Distinguishes from X Articles (which lack tweetText entirely).
+    Distinguishes from threads (which have multiple tweetText elements).
+    """
+    js = (
+        "(function(){"
+        "var nodes=document.querySelectorAll('[data-testid=tweetText]');"
+        "if(nodes.length!==1)return JSON.stringify({is_long:false});"
+        "var text=nodes[0].innerText||'';"
+        "if(text.length<MIN_CHARS)return JSON.stringify({is_long:false});"
+        "var article=document.querySelector('article[data-testid=tweet]');"
+        "var nameEl=article?article.querySelector('[data-testid=User-Name]'):null;"
+        "var handle='';var author='';"
+        "if(nameEl){var spans=nameEl.querySelectorAll('span');"
+        "for(var j=0;j<spans.length;j++){var s=spans[j].textContent||'';"
+        "if(s.indexOf('@')===0){handle=s.substring(1);break;}}"
+        "var nameSpan=nameEl.querySelector('span');if(nameSpan)author=nameSpan.textContent||'';}"
+        "return JSON.stringify({is_long:true,author:author,handle:handle,content:text,length:text.length});"
+        "})()"
+    ).replace("MIN_CHARS", str(min_chars))
+
+    escaped_js = js.replace("\\", "\\\\").replace('"', '\\"')
+    if browser == "chrome":
+        jxa = f'var app=Application("Google Chrome");app.windows[0].activeTab().execute({{javascript:"{escaped_js}"}});'
+    elif browser == "safari":
+        jxa = f'var app=Application("Safari");app.doJavaScript("{escaped_js}",{{in:app.windows[0].currentTab()}});'
+    else:
+        return None
+
+    result = subprocess.run(["osascript", "-l", "JavaScript"], input=jxa, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+
+    try:
+        data = json.loads(result.stdout.strip())
+        if not data.get("is_long"):
             return None
         return data
     except Exception:
@@ -339,7 +538,9 @@ def strip_html_to_text(html):
     return text
 
 
-def fetch_webpage(url, max_chars, browser=None):
+def fetch_webpage(url, browser=None):
+    """Returns the full article content (Web Clipper parity). Truncation for
+    LLM context happens later in ai_process, not here."""
     # Try direct browser extraction first (bypasses bot protection)
     if browser:
         browser_data = fetch_from_browser(browser)
@@ -347,18 +548,19 @@ def fetch_webpage(url, max_chars, browser=None):
             title = browser_data.get("title", "")
             title = re.split(r"\s*[|\-—]\s*", title)[0].strip()
             html = browser_data["html"]
-            content = html_to_markdown(html)
+            content = clean_chrome(html_to_markdown(html))
             return {
                 "title": title,
                 "author": browser_data.get("author", ""),
-                "content": content[:max_chars],
+                "content": content,
                 "published": parse_published_date(browser_data.get("published", "")),
-                "has_images": has_images_in_html(html),
+                # clean_chrome strips images, so the saved note has none.
+                "has_images": False,
             }
 
     # Fall back to trafilatura (for clipboard URLs without browser context)
     downloaded = trafilatura.fetch_url(url)
-    
+
     # Try to get HTML output first for better markdown conversion
     html_content = trafilatura.extract(
         downloaded,
@@ -369,13 +571,12 @@ def fetch_webpage(url, max_chars, browser=None):
         output_format='html',
         no_fallback=False,
     ) or ""
-    
+
     content = ""
     has_images = False
     if html_content:
-        has_images = has_images_in_html(html_content)
-        content = html_to_markdown(html_content)
-    
+        content = clean_chrome(html_to_markdown(html_content))
+
     # Fall back to plain text if HTML extraction failed
     if not content:
         content = trafilatura.extract(
@@ -390,7 +591,7 @@ def fetch_webpage(url, max_chars, browser=None):
     published = None
     if downloaded:
         title, author, description = extract_html_meta(downloaded)
-        
+
         # Try to extract published date from raw HTML
         pub_match = re.search(
             r'<meta[^>]+(?:property=["\']article:published_time["\']|name=["\']date["\'])[^>]+content=["\']([^"\']+)["\']',
@@ -401,7 +602,7 @@ def fetch_webpage(url, max_chars, browser=None):
         )
         if pub_match:
             published = parse_published_date(pub_match.group(1))
-        
+
         # Try JSON-LD for published date
         if not published:
             ld_match = re.search(r'"datePublished"\s*:\s*"([^"]+)"', downloaded)
@@ -419,9 +620,12 @@ def fetch_webpage(url, max_chars, browser=None):
     return {
         "title": title,
         "author": author,
-        "content": content[:max_chars],
+        "content": content,
         "published": published,
-        "has_images": has_images,
+        # clean_chrome already stripped images from this content path; the
+        # has_images flag reflects what's in the saved note, not what was
+        # on the source page.
+        "has_images": False,
     }
 
 # ── AI ────────────────────────────────────────────────────────────────────────
@@ -453,14 +657,14 @@ Return JSON with:
 - "type": one of: insight, resource, opinion, announcement, tutorial, thread"""
 
     elif content_type == "article":
-        return f"""X/Twitter Article by @{data.get('handle', '')} ({data.get('author', '')}):
+        return f"""X/Twitter long-form post by @{data.get('handle', '')} ({data.get('author', '')}):
 
 {data['content']}
 
 Return JSON with:
-- "title": 3-8 word specific title capturing the article's main topic
-- "summary": 2-4 sentences synthesizing the article's argument or thesis
-- "points": array of 3-7 key takeaways from the article
+- "title": 3-8 word title that captures the SCOPE of the post. If the post is a list of N distinct items or observations, name the scope (e.g. "30+ AI Agent Opportunities", "10 Lessons from Failed Startups"), do NOT pick the first item as the title.
+- "summary": 2-4 sentences synthesizing the post's full argument or the breadth of ideas it covers
+- "points": array of key takeaways. CRITICAL: if the post has explicit numbered or sectioned structure (Roman numerals like "I, II, III", numbered headers "1.", "2.", "3.", or any explicit section breaks) you MUST preserve those exact sections as the points, one per section, in order. Each point should be a specific claim (not a generic restatement). Otherwise, return 5-12 takeaways: 10-12 for long lists of distinct observations, 5-7 for a single argument with supporting points. Do not include questions, hedges, or generic platitudes.
 - "tags": {tag_instruction}
 - "type": one of: article, insight, opinion, tutorial, resource"""
 
@@ -481,11 +685,16 @@ Author: {data.get('author', 'unknown')}
 
 {data['content']}
 
-Return JSON with:
-- "summary": 2-3 sentences on what this covers and why it matters
-- "points": array of 3-5 key takeaways
-- "tags": {tag_instruction}
-- "type": one of: article, resource, opinion, tutorial, reference"""
+Return a single JSON OBJECT with EXACTLY these four top-level keys: summary, points, tags, type. Do NOT include any other keys. Do NOT include the strings "tags", "type", "summary", or "points" inside the points array.
+
+Field requirements:
+- summary (string): 2-3 sentences on what this covers and why it matters.
+- points (array of strings): 5-12 distinct, specific takeaways. Each item must be a complete sentence claim, NOT a JSON field name. If the article has explicit sections (numbered or headed), preserve those exact sections one-per-point.
+- tags (array of strings): {tag_instruction}
+- type (string): one of: article, resource, opinion, tutorial, reference
+
+Example shape (do not copy the values, just the structure):
+{{"summary": "One to three sentences here.", "points": ["Specific claim 1.", "Specific claim 2.", "Specific claim 3."], "tags": ["topic", "domain"], "type": "article"}}"""
 
 
 def call_ollama(prompt, model, base_url):
@@ -527,7 +736,11 @@ def call_anthropic(prompt, model, api_key):
         },
         json={
             "model": model,
-            "max_tokens": 512,
+            # 4096 leaves room for a long title + summary + 5-12 detailed
+            # points + tags + JSON scaffolding. 512 was way too low and
+            # truncated the response mid-list, causing the "1 key point"
+            # symptom on long articles.
+            "max_tokens": 4096,
             "messages": [{"role": "user", "content": prompt + "\n\nReturn only valid JSON."}],
         },
         timeout=60,
@@ -536,21 +749,83 @@ def call_anthropic(prompt, model, api_key):
     return json.loads(resp.json()["content"][0]["text"])
 
 
+_JSON_FIELD_NAMES = {
+    "title", "summary", "points", "tags", "type", "subtype", "domain", "author",
+}
+
+
+def _sanitize_ai_response(ai):
+    """Local Ollama models sometimes flatten the JSON structure and put field
+    names (tags, type, etc.) inside the points array as literal strings.
+    Drop those plus JSON-literal stragglers so the final note isn't polluted."""
+    if not isinstance(ai, dict):
+        return ai
+
+    points = ai.get("points")
+    if isinstance(points, list):
+        cleaned = []
+        for p in points:
+            if not isinstance(p, str):
+                continue
+            s = p.strip().rstrip(":").rstrip(",").strip()
+            if not s:
+                continue
+            # Skip literal field names
+            if s.lower() in _JSON_FIELD_NAMES:
+                continue
+            # Skip strings that look like raw JSON literals: ["x","y"] or "x"
+            if re.fullmatch(r"\[.*\]", s) or re.fullmatch(r'".*"', s):
+                continue
+            # Skip values that are single-word "type" values
+            if s.lower() in {"article", "insight", "opinion", "resource", "tutorial", "reference"}:
+                continue
+            cleaned.append(p)
+        ai["points"] = cleaned
+
+    # If tags came back as a string instead of a list, try to parse it
+    tags = ai.get("tags")
+    if isinstance(tags, str):
+        try:
+            parsed = json.loads(tags)
+            if isinstance(parsed, list):
+                ai["tags"] = parsed
+        except Exception:
+            pass
+
+    return ai
+
+
 def ai_process(content_type, data, config):
+    """Run the LLM. Stored data["content"] may be arbitrarily long (full article
+    captured for Web Clipper parity). We truncate ONLY for the prompt so the
+    LLM context stays bounded. The note keeps the full content untouched."""
     llm = config["llm"]
     tag_count = config["capture"]["tag_count"]
-    prompt = build_prompt(content_type, data, tag_count)
+
+    # Article-like content (long-form posts, threads, full webpages) gets a
+    # bigger budget; short tweets / YouTube descriptions stay small.
+    if content_type in ("article", "thread") or content_type == "webpage":
+        llm_max = config["capture"].get("article_max_chars", 16000)
+    else:
+        llm_max = config["capture"].get("max_content_chars", 3000)
+
+    llm_data = dict(data)
+    if "content" in llm_data and isinstance(llm_data["content"], str):
+        llm_data["content"] = llm_data["content"][:llm_max]
+
+    prompt = build_prompt(content_type, llm_data, tag_count)
     provider = llm["provider"]
 
     if provider == "ollama":
-        return call_ollama(prompt, llm["model"], llm["base_url"])
+        result = call_ollama(prompt, llm["model"], llm["base_url"])
     elif provider == "openai":
-        return call_openai(prompt, llm["model"], llm["base_url"], llm["api_key"])
+        result = call_openai(prompt, llm["model"], llm["base_url"], llm["api_key"])
     elif provider == "anthropic":
-        return call_anthropic(prompt, llm["model"], llm["api_key"])
+        result = call_anthropic(prompt, llm["model"], llm["api_key"])
     else:
         print(f"❌ Unknown provider '{provider}'. Use: ollama, openai, anthropic")
         sys.exit(1)
+    return _sanitize_ai_response(result)
 
 # ── Note builder ──────────────────────────────────────────────────────────────
 
@@ -636,8 +911,8 @@ def build_note(url, content_type, data, ai):
             body += f"\n\n## Key Points\n\n{points_md}"
         article_content = data.get("content", "")
         if article_content:
-            truncated = article_content[:5000]
-            body += f"\n\n## Full Content\n\n{truncated}"
+            # Full content, no truncation (Web Clipper parity)
+            body += f"\n\n## Full Content\n\n{article_content}"
 
     elif content_type == "youtube":
         author = data.get("author", "")
@@ -650,6 +925,14 @@ def build_note(url, content_type, data, ai):
         body = f"## Source\n\n[{data.get('title', title)}]({url}){f' — {author}' if author else ''}"
         if points_md:
             body += f"\n\n## Key Points\n\n{points_md}"
+        # Webpage clips get the full article body too (Web Clipper parity)
+        webpage_content = data.get("content", "")
+        if webpage_content:
+            # Drop a leading H1 that duplicates the note's own title.
+            webpage_content = re.sub(
+                r"^\s*#\s+[^\n]+\n+", "", webpage_content, count=1
+            )
+            body += f"\n\n## Article\n\n{webpage_content}"
 
     # Build optional frontmatter fields
     optional_fields = ""
@@ -657,7 +940,19 @@ def build_note(url, content_type, data, ai):
         optional_fields += f"published: {published}\n"
     optional_fields += f"has_images: {str(has_images).lower()}\n"
 
-    processed_flag = "true" if not is_stub else "false"
+    # State machine for wiki-ingest contract:
+    #   Stub (AI pending):       enriched: false   (no processed field)
+    #   Enriched (ready):        enriched: true    processed: false
+    #   After wiki-ingest:       enriched: true    processed: true   (ingest flips it)
+    #
+    # The Wiki/CLAUDE.md ingest spec filters on `processed: false`. Stubs
+    # don't have that field, so wiki-ingest naturally skips them until the
+    # background AI step finishes and writes the full frontmatter.
+    if is_stub:
+        state_fields = "enriched: false\n"
+    else:
+        state_fields = "enriched: true\nprocessed: false\n"
+
     # Escape any literal double quotes in the title so the YAML stays valid
     title_escaped = title.replace('"', '\\"')
     author_escaped = (data.get("author") or "").replace('"', '\\"')
@@ -673,8 +968,7 @@ source: {url}
 author: "{author_escaped}"
 {tags_block}
 date: {date}
-{optional_fields}processed: {processed_flag}
-domain: {domain}
+{optional_fields}{state_fields}domain: {domain}
 ---
 
 # {title}
@@ -759,27 +1053,29 @@ def spawn_processor(stub_path):
 ICONS = {"tweet": "🐦", "thread": "🧵", "youtube": "▶️", "webpage": "🌐", "article": "📝"}
 
 def fetch_for_url(url, config, from_browser=False):
+    """Returns (content_type, data) where data["content"] is the FULL article.
+    Truncation for LLM context happens later in ai_process, not here, so the
+    saved note keeps the complete source text (Web Clipper parity)."""
     content_type = detect_type(url)
     if content_type == "tweet":
         if from_browser:
-            # Try article extraction first (articles have no tweetText element)
+            # Try X Article extraction first (Articles lack tweetText entirely)
             article_data = fetch_article_from_browser(config["browser"])
             if article_data:
-                max_chars = config["capture"]["max_content_chars"]
                 html = article_data["html"]
-                content = html_to_markdown(html)
+                content = clean_x_chrome(html_to_markdown(html))
                 return "article", {
                     "author": article_data["author"],
                     "handle": article_data.get("handle", ""),
                     "title": "",
-                    "content": content[:max_chars],
-                    "has_images": has_images_in_html(html),
+                    "content": content,
+                    # We strip images in clean_x_chrome, so the saved note has none.
+                    "has_images": False,
                 }
 
-            # Then try thread extraction
+            # Then try thread extraction (multiple tweetText elements, same author)
             thread_data = fetch_thread_from_browser(config["browser"])
             if thread_data:
-                max_chars = config["capture"]["max_content_chars"]
                 tweets = thread_data["tweets"]
                 content = "\n\n---\n\n".join(
                     f"[{i+1}/{len(tweets)}] {t}" for i, t in enumerate(tweets)
@@ -787,9 +1083,23 @@ def fetch_for_url(url, config, from_browser=False):
                 return "thread", {
                     "author": thread_data["author"],
                     "handle": thread_data["handle"],
-                    "content": content[:max_chars],
+                    "content": content,
                     "tweet_count": len(tweets),
                     "tweets": tweets,
+                }
+
+            # Then try long-form tweet (single tweetText, but very long).
+            # X Premium lets users post up to 25k chars in one tweet, and
+            # oembed truncates these to a snippet. Pull from the DOM instead.
+            long_data = fetch_long_tweet_from_browser(config["browser"])
+            if long_data:
+                cleaned = clean_x_chrome(long_data["content"])
+                return "article", {
+                    "author": long_data.get("author", ""),
+                    "handle": long_data.get("handle", ""),
+                    "title": "",
+                    "content": cleaned,
+                    "has_images": False,
                 }
 
         # Fall back to regular tweet via oembed
@@ -799,7 +1109,7 @@ def fetch_for_url(url, config, from_browser=False):
         data = fetch_youtube(url)
     else:
         browser = config["browser"] if from_browser else None
-        data = fetch_webpage(url, config["capture"]["max_content_chars"], browser)
+        data = fetch_webpage(url, browser)
     return content_type, data
 
 
@@ -892,12 +1202,93 @@ def process_pending(stub_path):
         # Leave the sidecar in place. A re-run will retry.
         return
 
-    _, note = build_note(url, content_type, data, ai)
-    stub_path.write_text(note, encoding="utf-8")
+    title, note = build_note(url, content_type, data, ai)
+
+    # Rename the file to match the AI-generated title if it differs from the
+    # stub. Safe because nothing else in the vault links to a freshly-clipped
+    # stub yet (it was created seconds ago). Falls back to in-place write if
+    # the target slug already exists for another clip.
+    date = datetime.now().strftime("%Y-%m-%d")
+    fmt = config["capture"]["filename_format"]
+    target_filename = make_filename(title, date, fmt)
+    target_path = stub_path.parent / target_filename
+
+    if target_path.resolve() == stub_path.resolve():
+        # Same slug — write in place.
+        stub_path.write_text(note, encoding="utf-8")
+        final_path = stub_path
+    elif target_path.exists():
+        # Collision with a different clip — keep the stub filename to avoid
+        # overwriting unrelated content. AI title still lives in frontmatter.
+        stub_path.write_text(note, encoding="utf-8")
+        final_path = stub_path
+    else:
+        # Clean rename to the AI title.
+        target_path.write_text(note, encoding="utf-8")
+        try:
+            stub_path.unlink()
+        except FileNotFoundError:
+            pass
+        final_path = target_path
+
     try:
         sidecar.unlink()
     except FileNotFoundError:
         pass
+    return final_path
+
+
+def fix_orphans():
+    """Find clips marked processed: true that have no matching Wiki/Summaries
+    page and flip them back to processed: false so wiki-ingest picks them up.
+
+    Useful any time you suspect ingest got out of sync (e.g. after a buggy
+    clipper version, or if you imported clips manually). Reversible: just
+    re-run wiki-ingest after this to backfill the missing summaries.
+
+    Run via: save-to-vault.py --fix-orphans"""
+    config = load_config()
+    clips_dir = output_dir(config)
+    vault = Path(config["vault_path"])
+    summaries = vault / "Wiki" / "Summaries"
+
+    if not clips_dir.exists():
+        print(f"No clips folder at {clips_dir}. Nothing to check.")
+        return
+
+    if not summaries.exists():
+        print(f"No Wiki/Summaries folder at {summaries}.")
+        print("If you're new to wiki-ingest, that's expected — there's nothing to be orphaned from.")
+        return
+
+    orphans = []
+    for clip in clips_dir.glob("*.md"):
+        text = clip.read_text(encoding="utf-8")
+        # Cheap frontmatter check; we only look at the processed line
+        if not re.search(r"^processed:\s*true\s*$", text, re.MULTILINE):
+            continue
+        # Look for a matching summary page (clipper preserves filenames).
+        # Wiki-ingest links source_file: "[[Sources/clips/<name>]]" so by
+        # convention the summary shares the clip's stem.
+        if not (summaries / clip.name).exists():
+            orphans.append(clip)
+
+    if not orphans:
+        print(f"✅ No orphans. All processed clips have matching summaries.")
+        return
+
+    print(f"Found {len(orphans)} orphan(s) (processed: true, no Wiki/Summaries page):")
+    for o in orphans:
+        print(f"  - {o.name}")
+    print()
+    print(f"Flipping processed: true → processed: false on each so the next")
+    print(f"wiki-ingest run picks them up.")
+
+    for clip in orphans:
+        text = clip.read_text(encoding="utf-8")
+        text = re.sub(r"^processed:\s*true\s*$", "processed: false", text, count=1, flags=re.MULTILINE)
+        clip.write_text(text, encoding="utf-8")
+    print(f"✅ Flipped {len(orphans)} clip(s).")
 
 
 def sweep_pending():
@@ -928,6 +1319,9 @@ def main():
         return
     if args and args[0] == "--sweep":
         sweep_pending()
+        return
+    if args and args[0] == "--fix-orphans":
+        fix_orphans()
         return
     capture()
 

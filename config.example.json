@@ -12,6 +12,7 @@
 
   "capture": {
     "max_content_chars": 3000,
+    "article_max_chars": 16000,
     "tag_count": 5,
     "filename_format": "title"
   }

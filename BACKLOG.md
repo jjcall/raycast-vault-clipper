@@ -38,6 +38,16 @@ Ranked, surf-and-clip use case in mind. Each item has a one-line "why."
 - **Why:** Interim title says "X Article by @handle" but if the JXA extraction picked up the author name we have a better string.
 - **Sketch:** Already partly there in `interim_title()`. Just polish.
 
+## Web Clipper parity gaps
+
+### Image downloading
+- **Why:** Web Clipper downloads inline images into `vault/attachments/` and rewrites src URLs to local paths. We currently capture `<img>` tags as remote URLs only, so the note breaks if the source page deletes the image.
+- **Sketch:** For each `![](url)` in the captured content, GET the URL, save bytes to `vault_path/attachments/<slug>-<n>.<ext>`, rewrite the markdown to `![](attachments/<slug>-<n>.<ext>)`. Skip if domain is blocked or content-type isn't image/*.
+- **Tradeoff:** clip time goes up by a few seconds per image. Could be moved to the background `--process` path so capture stays instant.
+
+### YouTube transcripts (already in earlier backlog)
+- Still relevant. YouTube clips are the one content type that doesn't get a full body yet.
+
 ## Maybe later
 
 - Screenshot of the tab saved next to the clip (for visual context on tweets / design articles).

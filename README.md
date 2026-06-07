@@ -1,32 +1,69 @@
 # raycast-vault-clipper
 
-A Raycast script that grabs the URL from your active browser tab, pulls the content (tweets, YouTube videos, articles), summarizes it with an LLM, and saves a Markdown note to your Obsidian vault.
+Two Raycast scripts for sending links from your active browser tab into an
+Obsidian vault.
 
-Hit a hotkey, get a note. No browser extension, no manual tagging.
+| Command | Script | Use it for |
+|---|---|---|
+| Save to Vault | `save-to-vault.py` | Comprehensive saved notes with extracted content, AI summary, tags, and frontmatter |
+| Read Later to Daily | `read-later.py` | One lightweight bookmark link appended to today's daily note |
+
+Use **Save to Vault** when you want a full note you can search, process, and
+revisit. Use **Read Later to Daily** when you only want to park a link for
+later.
 
 ---
 
 ## Why this exists
 
-The official Obsidian Web Clipper is a browser extension, which means it's blocked in a lot of corporate environments. The Raycast extensions that already exist (Obsidian Smart Capture, Obsidian Clippings) either need a Raycast Pro subscription for AI, depend on Obsidian community plugins, or don't differentiate between content types.
+The official Obsidian Web Clipper is a browser extension, which can be blocked
+in locked-down work environments. Existing Raycast options also tend to require
+Raycast Pro, Obsidian plugins, or a capture flow that does not match how you
+use your vault.
 
-This script sidesteps all of that:
+This repo keeps the path simple:
 
-- It's a Raycast script, not a browser extension
-- You bring your own LLM (Ollama runs locally for free)
-- It writes files directly to your vault folder, no Obsidian plugins needed
-- Tweets, YouTube videos, and articles are each fetched and structured differently
+- It runs from Raycast, no browser extension needed.
+- It writes directly to your vault folder.
+- The full clipper can use your own LLM.
+- The read-later command has no LLM step. It just saves the link.
 
 ---
 
-## What it does
+## What Each Script Does
 
-1. Reads the active tab URL from Chrome or Safari (or falls back to your clipboard)
-2. Figures out what kind of content it is and fetches accordingly
-3. Sends the content to your LLM for a title, summary, key points, and tags
-4. Writes a Markdown note with frontmatter, wiki links, and source URL to your vault
+### Save to Vault
 
-Works with Ollama (local, free), OpenAI, Anthropic, or any OpenAI-compatible endpoint like Groq, Together, or LM Studio.
+`save-to-vault.py` is the full clipper.
+
+1. Reads the active tab URL from Chrome or Safari, with clipboard fallback.
+2. Detects tweets, X threads, X articles, YouTube videos, and webpages.
+3. Extracts the source content.
+4. Writes a stub note immediately.
+5. Runs AI enrichment in the background for summary, key points, tags, and type.
+6. Saves the final note to your configured output folder.
+
+The saved note keeps the full article body under `## Article` or
+`## Full Content`. The `article_max_chars` setting only caps what gets sent to
+the LLM, not what gets stored in Obsidian.
+
+### Read Later to Daily
+
+`read-later.py` is intentionally small.
+
+1. Reads the active tab URL and title from Chrome or Safari, with clipboard
+   fallback.
+2. Cleans the title. For X/Twitter links, it trims long tweet text into a short
+   title instead of dumping the whole post.
+3. Appends one bookmark bullet under `## Notes` in today's daily note.
+4. Creates the daily note if it does not exist yet.
+5. De-dupes by URL, so hitting the hotkey twice does not spam the note.
+
+Example output:
+
+```markdown
+- [b] [Bill Guo: designing in code be like...](<https://x.com/billguo/status/123>)
+```
 
 ---
 
@@ -36,7 +73,11 @@ Works with Ollama (local, free), OpenAI, Anthropic, or any OpenAI-compatible end
 - [Raycast](https://raycast.com)
 - Python 3.9+
 - An Obsidian vault
-- One of: [Ollama](https://ollama.com) (free/local), OpenAI API key, or Anthropic API key
+- Chrome or Safari
+- For `save-to-vault.py` only: Ollama, OpenAI, Anthropic, or another
+  OpenAI-compatible endpoint
+
+`read-later.py` uses only the Python standard library.
 
 ---
 
@@ -55,63 +96,74 @@ cd raycast-vault-clipper
 cp config.example.json config.json
 ```
 
-Open `config.json` and fill in your vault path and preferred LLM (see [Configuration](#configuration) below).
+Open `config.json` and set your vault path and browser. If you plan to use the
+full clipper, also set your LLM provider.
 
-### 3. Add to Raycast
+### 3. Add the scripts to Raycast
 
-- Open Raycast, go to `⌘,` > Extensions > Scripts
-- Click `+` > Add Scripts Directory > select this repo folder
-- Search "Save to Vault" in Raycast and assign a hotkey (e.g. `⌥⇧S`)
+- Open Raycast settings.
+- Go to **Extensions** > **Scripts**.
+- Click `+` > **Add Scripts Directory**.
+- Select this repo folder.
+- Search for **Save to Vault** and assign a hotkey.
+- Search for **Read Later to Daily** and assign a second hotkey.
 
-That's it. No `pip install`, no PATH twiddling, no shebang surgery.
+That is it. No Obsidian plugin, no browser extension.
 
-### How dependencies work
+---
 
-The script auto-bootstraps a virtual environment the first time you run it. On first run you'll see:
+## Dependencies
 
+`read-later.py` has no third-party dependencies.
+
+`save-to-vault.py` bootstraps its own virtual environment the first time you run
+it. On first run you will see:
+
+```text
+First-run setup: creating venv and installing dependencies...
+(this takes 10-30 seconds, only happens once)
 ```
-⚙️  First-run setup: creating venv and installing dependencies...
-    (this takes 10-30 seconds, only happens once)
-```
 
-That creates `.venv/` next to the script with `requests`, `trafilatura`, and `markdownify` inside. Every run after that uses the venv directly, so the hotkey is instant.
+That creates `.venv/` next to the script and installs `requests`,
+`trafilatura`, and `markdownify`. Every run after that uses the local venv.
 
-Works with any Python 3.9+ on `PATH` — Apple's `/usr/bin/python3`, Homebrew (Intel or Apple Silicon), pyenv, conda, whatever. The script doesn't care which one it bootstraps from.
-
-If you ever need to rebuild (corruption, Python upgrade, moved the repo): `rm -rf .venv` and run the script once.
-
-#### Tip: warm the venv before assigning the hotkey
-
-So the first Raycast invocation doesn't take 30 seconds, run it once from the terminal first:
+To warm it up before assigning a hotkey:
 
 ```bash
 ./save-to-vault.py
 ```
 
-The first run will install deps and then complain about no URL (expected). After that, the venv is ready and the Raycast hotkey is instant.
+The first run may complain about no URL if you run it from the terminal. That is
+fine. The venv is ready after that.
+
+If you ever need to rebuild the venv, delete `.venv/` and run
+`save-to-vault.py` again.
 
 ---
 
 ## Configuration
 
-All settings live in `config.json` (gitignored, your local copy only).
+All settings live in `config.json`, which is gitignored.
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `vault_path` | `~/Documents/Obsidian Vault` | Path to your Obsidian vault |
-| `output_folder` | `Sources/clips` | Folder inside vault where clips go |
-| `browser` | `chrome` | Where to read the active tab: `chrome` or `safari` |
+| `output_folder` | `Sources/clips` | Where full saved notes are written |
+| `browser` | `chrome` | Browser to read from: `chrome` or `safari` |
 | `llm.provider` | `ollama` | `ollama`, `openai`, or `anthropic` |
 | `llm.model` | `llama3.2:3b` | Model name |
-| `llm.base_url` | `http://localhost:11434` | API base URL (Ollama or OpenAI-compatible) |
-| `llm.api_key` | `""` | API key (not needed for Ollama) |
-| `capture.max_content_chars` | `3000` | Max characters sent to the LLM |
+| `llm.base_url` | `http://localhost:11434` | API base URL |
+| `llm.api_key` | `""` | API key, not needed for Ollama |
+| `capture.max_content_chars` | `3000` | Max short-content characters sent to the LLM |
+| `capture.article_max_chars` | `16000` | Max article characters sent to the LLM |
 | `capture.tag_count` | `5` | Number of tags to generate |
 | `capture.filename_format` | `title` | `title`, `date-title`, or `title-date` |
 
-### LLM provider setup
+`read-later.py` only needs `vault_path` and `browser`.
 
-**Ollama** (recommended, runs locally)
+### LLM Provider Setup
+
+For Ollama:
 
 ```bash
 brew install ollama
@@ -127,7 +179,7 @@ ollama pull llama3.2:3b
 }
 ```
 
-**OpenAI** (or any OpenAI-compatible endpoint: Groq, Together, LM Studio)
+For OpenAI or an OpenAI-compatible endpoint:
 
 ```json
 "llm": {
@@ -138,9 +190,7 @@ ollama pull llama3.2:3b
 }
 ```
 
-For Groq, set `base_url` to `https://api.groq.com/openai` and use a Groq model name.
-
-**Anthropic**
+For Anthropic:
 
 ```json
 "llm": {
@@ -155,33 +205,82 @@ For Groq, set `base_url` to `https://api.groq.com/openai` and use a Groq model n
 
 ## Usage
 
-1. Open a page in Chrome (tweet, YouTube video, article, whatever)
-2. Press your Raycast hotkey
-3. The stub note lands in your vault immediately. The summary, tags, and key points fill in seconds later as the LLM finishes.
-4. Check your vault
+### Save a Full Note
 
-If no browser is open, copy a URL to your clipboard first. The script will pick it up.
+1. Open a page in Chrome or Safari.
+2. Run **Save to Vault** from Raycast.
+3. A stub note lands in your configured output folder.
+4. The background process fills in the AI summary, key points, tags, and final
+   frontmatter.
 
-### How async enrichment works
+If no browser tab is available, copy a URL first. The script will use the
+clipboard as a fallback.
 
-Each capture happens in two phases so the hotkey feels instant:
+### Save a Read-Later Link
 
-1. **Sync:** the script reads your tab, fetches the content, writes a stub note (`processed: false`) plus a sidecar JSON in `Sources/clips/_pending/`, and exits.
-2. **Background:** a detached Python subprocess runs the LLM, rewrites the note with summary + tags + key points (`processed: true`), and deletes the sidecar.
+1. Open the page, post, or tweet you want to save.
+2. Run **Read Later to Daily** from Raycast.
+3. The script appends one `[b]` bookmark bullet under `## Notes` in
+   `Journal/Daily/YYYY-MM-DD.md`.
 
-If your laptop sleeps mid-process or the LLM is down, the sidecar stays in `_pending/` as a flag. Re-run anytime to clean it up:
+You can also run it from the terminal:
+
+```bash
+./read-later.py --url https://example.com/post --title "Example Post"
+```
+
+For testing without writing to the vault:
+
+```bash
+./read-later.py --url https://example.com/post --title "Example Post" --dry-run
+```
+
+---
+
+## Maintenance Commands
+
+### Sweep Pending Saves
+
+If your laptop sleeps or the LLM is down, a pending sidecar may stay in
+`<output_folder>/_pending/`. Retry all pending saves with:
 
 ```bash
 ./save-to-vault.py --sweep
 ```
 
-That walks `_pending/`, retries every leftover sidecar, and removes the ones it can process. You can also wire `--sweep` as a second Raycast command if you want a one-click "catch up."
+### Fix Processed Notes Missing Summaries
+
+If a saved note is marked processed but no matching downstream summary exists:
+
+```bash
+./save-to-vault.py --fix-orphans
+```
+
+### Debug Browser Detection
+
+X changes its DOM often. If a tweet, thread, or X article clips in the wrong
+shape, run:
+
+```bash
+./diagnose-tab.py
+```
+
+It prints the selectors and content lengths the clipper can see in the active
+tab. That usually tells you whether the issue is detection, extraction, or LLM
+truncation.
 
 ---
 
-## Output format
+## Output Examples
 
-Each saved note looks like this:
+### Read Later
+
+```markdown
+## Notes
+- [b] [Example Post](<https://example.com/post>)
+```
+
+### Full Save
 
 ```markdown
 ---
@@ -195,17 +294,20 @@ tags:
   - music-history
   - fashion
 date: 2026-03-16
+enriched: true
+processed: false
+domain: subcultures
 ---
 
 # Punks vs Rude Boys Subcultures
 
 ## Summary
 
-A comparison of two iconic youth subcultures: punks, known for their anti-establishment views and DIY aesthetic, and rude boys, rooted in the Jamaican diaspora with sharp suits and ties to ska and reggae music.
+A concise AI summary goes here.
 
 ## Tweet
 
-> Punks were known for their anti-establishment views and ripped clothing, safety pins, and mohawks dyed in bright colors. Rude boys were part of a subculture that had its origins in the Jamaican diaspora with sharp suits and pork pie hats closely associated with ska and reggae...
+> Source content goes here.
 
 ## Notes
 
@@ -218,4 +320,5 @@ A comparison of two iconic youth subcultures: punks, known for their anti-establ
 
 ## Contributing
 
-PRs welcome. The script is intentionally a single file so it's easy to read and modify.
+PRs welcome. The scripts are intentionally small so they stay easy to inspect,
+debug, and adapt to a specific vault workflow.
